@@ -33,7 +33,15 @@ The `7d`, `30d`, and `90d` controls apply time cutoffs to rollout records that s
 
 The report displays the earliest and latest local timestamps it found. When fewer than 90 days remain locally, the `90d` and `All` views will intentionally match. Deleted, rotated, or unavailable rollout files cannot be reconstructed by this utility.
 
-The Quota trajectory follows the same selected range as the model totals. Longer timelines are downsampled to keep the report responsive; the exported JSON contains the same sampled trajectory shown in the chart.
+The Quota history chart follows the same selected range as the model totals and sits directly beneath the range controls. `All` is the default. Longer timelines are downsampled to keep the report responsive; the exported JSON contains the same sampled history shown in the chart.
+
+The 5-hour and Weekly controls switch between two separate histories. The chart converts the stored used percentage to quota remaining:
+
+```text
+quota remaining = 100% - used percentage
+```
+
+Lines connect real chronological samples only while quota use is advancing inside the same observed period. A percentage recovery or a long interval without recorded activity creates a gap instead of an invented connecting line.
 
 ## Quota-Point Attribution
 
@@ -62,9 +70,9 @@ recorded tokens per quota point =
   recorded tokens / observed quota points
 ```
 
-The report translates the last value into `1 quota point every X recorded tokens`. One point is one percentage point on that quota's usage gauge. Fewer tokens per point means faster observed quota drain; more tokens per point means slower observed drain.
+The report displays the first two rates as `% quota / 1M recorded tokens`. One point is 1% on that quota's usage gauge. A larger rate means faster observed quota drain; a smaller rate means slower observed drain.
 
-The 5-hour and weekly rankings are separate because they come from different windows. Each cell includes its own observed point count, and samples below 25 points are marked as early.
+Each model card places recorded-token volume, 5-hour drain, and Weekly drain in one progress-bar group. The two drain bars use one shared scale across every displayed model and both periods, so their lengths can be compared directly. Rankings remain separate for 5-hour and Weekly because they come from different windows. Samples below 25 observed points are marked preliminary and are not ranked.
 
 ## Important Limitations
 

@@ -200,7 +200,7 @@ class CodexResetExpiryTests(unittest.TestCase):
         self.assertIn('http-equiv="refresh" content="300"', dashboard)
         self.assertIn("Live local dashboard", dashboard)
         self.assertIn("Auto-refreshes every 300 seconds", dashboard)
-        self.assertIn('href="/?days=30"', dashboard)
+        self.assertIn('href="/?days=0"', dashboard)
 
     def test_support_helpers_format_progress_and_words(self):
         self.assertEqual(module.ascii_bar(50, width=10), "[#####-----]")
@@ -482,6 +482,14 @@ class CodexResetExpiryTests(unittest.TestCase):
             [point["usedPercent"] for point in report["timeline"]],
             [10.0, 12.0, 15.0, 1.0, 2.0],
         )
+        self.assertEqual(
+            [point["usedPercent"] for point in report["weeklyTimeline"]],
+            [40.0, 41.0, 43.0, 40.0, 40.0],
+        )
+        self.assertEqual(report["timelines"]["fiveHour"], report["timeline"])
+        self.assertEqual(report["timelines"]["weekly"], report["weeklyTimeline"])
+        self.assertEqual(report["timeline"][0]["windowMinutes"], 300)
+        self.assertEqual(report["weeklyTimeline"][0]["windowMinutes"], 10080)
         self.assertEqual(report["timelineDays"], 30)
         self.assertEqual(report["localHistoryDays"], 1)
         self.assertEqual(report["localHistoryStart"], "2026-07-08T12:00:00+00:00")
@@ -494,7 +502,8 @@ class CodexResetExpiryTests(unittest.TestCase):
                     "2026-07-08T12:00:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 10, 1000
                 ),
                 self.history_event(
-                    "2026-07-08T12:05:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 12, 1000
+                    "2026-07-08T12:05:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 12, 1000,
+                    secondary_used=42,
                 ),
             ],
             now=datetime(2026, 7, 9, tzinfo=timezone.utc),
@@ -511,14 +520,29 @@ class CodexResetExpiryTests(unittest.TestCase):
         self.assertIn("Model usage", dashboard)
         self.assertIn("gpt-5.6-codex", dashboard)
         self.assertIn("Recorded token volume", dashboard)
-        self.assertIn("Quota cost by model", dashboard)
-        self.assertIn("5-hour quota cost", dashboard)
-        self.assertIn("Weekly quota cost", dashboard)
-        self.assertIn("1 quota point every", dashboard)
-        self.assertIn("pts / 1M tokens", dashboard)
-        self.assertIn("early sample", dashboard)
+        self.assertIn("5-hour drain rate", dashboard)
+        self.assertIn("Weekly drain rate", dashboard)
+        self.assertIn("% quota / 1M recorded tokens", dashboard)
+        self.assertIn("Preliminary estimate", dashboard)
         self.assertIn("Metric definitions", dashboard)
-        self.assertIn("Quota trajectory", dashboard)
+        self.assertIn("Quota history", dashboard)
+        self.assertIn("Quota remaining · gaps mark recoveries or periods without recorded activity", dashboard)
+        self.assertIn('data-quota-trajectory', dashboard)
+        self.assertIn('data-quota-window="fiveHour"', dashboard)
+        self.assertIn('data-quota-window="weekly"', dashboard)
+        self.assertIn('data-quota-chart="fiveHour"', dashboard)
+        self.assertIn('data-quota-chart="weekly" hidden', dashboard)
+        self.assertIn('class="history-segment"', dashboard)
+        self.assertIn('class="history-point"', dashboard)
+        self.assertIn('class="metric-bar-row quota-metric"', dashboard)
+        self.assertIn('data-drain-period="fiveHour" data-rate="20.0000"', dashboard)
+        self.assertIn('data-drain-period="weekly" data-rate="20.0000"', dashboard)
+        self.assertIn("88% 5-hour quota remaining", dashboard)
+        self.assertIn("58% Weekly quota remaining", dashboard)
+        self.assertNotIn("Quota drain by model", dashboard)
+        self.assertNotIn("data-window-select", dashboard)
+        self.assertNotIn("data-window-nav", dashboard)
+        self.assertNotIn("quota-drain-bars", dashboard)
         self.assertIn("Last 30 days requested · 1 day available locally", dashboard)
         self.assertIn("<svg", dashboard)
         self.assertIn("Export JSON", dashboard)
@@ -527,6 +551,7 @@ class CodexResetExpiryTests(unittest.TestCase):
         self.assertIn("Actual token counts", dashboard)
 
     def test_static_dashboard_embeds_clickable_history_ranges(self):
+        self.assertEqual(module.DEFAULT_HISTORY_DAYS, 0)
         events = [
             self.history_event(
                 "2026-07-08T12:00:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 10, 1000
@@ -542,7 +567,7 @@ class CodexResetExpiryTests(unittest.TestCase):
         }
         dashboard = module.render_html_dashboard(
             self.sample_payload(),
-            model_report=reports[30],
+            model_report=reports[0],
             model_reports=reports,
             now=datetime(2026, 7, 9, tzinfo=timezone.utc),
             local_tz=timezone.utc,
@@ -555,9 +580,17 @@ class CodexResetExpiryTests(unittest.TestCase):
         self.assertIn('data-history-range="7"', dashboard)
         self.assertIn('data-history-range="90"', dashboard)
         self.assertIn('data-history-range="0"', dashboard)
+        self.assertIn('data-default-history="0"', dashboard)
+        self.assertIn('<div class="history-variant" data-history-panel="0">', dashboard)
         self.assertIn("history.replaceState", dashboard)
         self.assertIn("available locally", dashboard)
-        self.assertEqual(dashboard.count("Quota cost by model"), 4)
+        self.assertEqual(dashboard.count("Quota history"), 4)
+
+        all_panel_start = dashboard.index('<div class="history-variant" data-history-panel="0">')
+        all_panel_end = dashboard.index("<script>", all_panel_start)
+        all_panel = dashboard[all_panel_start:all_panel_end]
+        self.assertLess(all_panel.index("Quota history"), all_panel.index("Latest model"))
+        self.assertLess(all_panel.index("Latest model"), all_panel.index("5-hour drain rate"))
 
     def test_history_ranges_apply_distinct_local_cutoffs(self):
         events = [
@@ -603,6 +636,168 @@ class CodexResetExpiryTests(unittest.TestCase):
             ],
         )
         self.assertEqual(reports[0]["timeline"], reports[90]["timeline"])
+        model_colors = {
+            days: {
+                model["model"]: model["color"]
+                for model in report["models"]
+            }
+            for days, report in reports.items()
+        }
+        self.assertEqual(model_colors[7]["gpt-5.6-codex"], model_colors[0]["gpt-5.6-codex"])
+        self.assertEqual(model_colors[30]["gpt-5.5"], model_colors[0]["gpt-5.5"])
+
+    def test_model_progress_bars_share_scale_and_mark_preliminary_samples(self):
+        events = [
+            self.history_event(
+                "2026-07-08T12:00:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 0, 1000,
+                secondary_used=0,
+            ),
+            self.history_event(
+                "2026-07-08T12:05:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 30, 1000,
+                secondary_used=30,
+            ),
+            self.history_event(
+                "2026-07-08T12:10:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 0, 3000,
+                secondary_used=0,
+                secondary_reset=4000,
+            ),
+            self.history_event(
+                "2026-07-08T12:15:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 50, 3000,
+                secondary_used=50,
+                secondary_reset=4000,
+            ),
+        ]
+        ranked_report = module.build_model_usage_report(
+            events,
+            now=datetime(2026, 7, 9, tzinfo=timezone.utc),
+            history_days=30,
+        )
+        ranked_html = module.render_model_usage_section(
+            ranked_report,
+            local_tz=timezone.utc,
+        )
+
+        self.assertEqual(ranked_html.count("#1 · drains quota fastest"), 2)
+        self.assertEqual(ranked_html.count("#2 quota drain rate"), 2)
+        self.assertNotIn("Preliminary estimate", ranked_html)
+        self.assertIn('data-shared-drain-max="250.0000"', ranked_html)
+        self.assertEqual(ranked_html.count('data-rate="250.0000"'), 2)
+        self.assertEqual(ranked_html.count('data-rate="150.0000"'), 2)
+        self.assertEqual(ranked_html.count("--quota-width:100.00%"), 2)
+        self.assertEqual(ranked_html.count("--quota-width:60.00%"), 2)
+
+        preliminary_report = module.build_model_usage_report(
+            events[:1] + [
+                self.history_event(
+                    "2026-07-08T12:05:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 5, 1000,
+                    secondary_used=5,
+                )
+            ],
+            now=datetime(2026, 7, 9, tzinfo=timezone.utc),
+            history_days=30,
+        )
+        preliminary_html = module.render_model_usage_section(
+            preliminary_report,
+            local_tz=timezone.utc,
+        )
+
+        self.assertIn("Preliminary estimate", preliminary_html)
+        self.assertNotIn("drains quota fastest", preliminary_html)
+        self.assertIn('class="quota-fill preliminary"', preliminary_html)
+
+    def test_historical_chart_preserves_multiple_real_segments(self):
+        first_reset = int(datetime(2026, 7, 8, 17, 0, tzinfo=timezone.utc).timestamp())
+        second_reset = int(datetime(2026, 7, 8, 22, 0, tzinfo=timezone.utc).timestamp())
+        events = [
+            self.history_event(
+                "2026-07-08T12:00:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 10, first_reset
+            ),
+            self.history_event(
+                "2026-07-08T13:00:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 25, first_reset
+            ),
+            self.history_event(
+                "2026-07-08T17:00:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 5, second_reset
+            ),
+            self.history_event(
+                "2026-07-08T18:00:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 35, second_reset
+            ),
+        ]
+        report = module.build_model_usage_report(
+            events,
+            now=datetime(2026, 7, 9, tzinfo=timezone.utc),
+            history_days=30,
+        )
+        period_html = module.render_quota_timeline_svg(
+            report,
+            "fiveHour",
+            timezone.utc,
+        )
+
+        self.assertEqual(period_html.count('class="history-segment"'), 2)
+        self.assertEqual(period_html.count('class="history-point"'), 4)
+        self.assertIn("75% 5-hour quota remaining", period_html)
+        self.assertIn("65% 5-hour quota remaining", period_html)
+        self.assertIn("Jul 8, 2026 at 12:00 PM", period_html)
+        self.assertIn("Jul 8, 2026 at 6:00 PM", period_html)
+        self.assertNotIn("data-window-select", period_html)
+
+    def test_historical_chart_never_connects_distinct_quota_windows(self):
+        report = {
+            "models": [{"model": "gpt-5.5", "color": "#b54f78"}],
+            "timelines": {
+                "fiveHour": [
+                    {
+                        "timestamp": "2026-07-08T12:00:00Z",
+                        "usedPercent": 10,
+                        "model": "gpt-5.5",
+                        "limitId": "codex",
+                        "windowId": "window-1",
+                    },
+                    {
+                        "timestamp": "2026-07-08T13:00:00Z",
+                        "usedPercent": 20,
+                        "model": "gpt-5.5",
+                        "limitId": "codex",
+                        "windowId": "window-1",
+                    },
+                    {
+                        "timestamp": "2026-07-08T14:00:00Z",
+                        "usedPercent": 30,
+                        "model": "gpt-5.5",
+                        "limitId": "codex",
+                        "windowId": "window-2",
+                    },
+                    {
+                        "timestamp": "2026-07-08T15:00:00Z",
+                        "usedPercent": 40,
+                        "model": "gpt-5.5",
+                        "limitId": "codex",
+                        "windowId": "window-2",
+                    },
+                ]
+            },
+        }
+
+        period_html = module.render_quota_timeline_svg(
+            report,
+            "fiveHour",
+            timezone.utc,
+        )
+
+        self.assertEqual(period_html.count('class="history-segment"'), 2)
+        self.assertEqual(period_html.count('class="history-point"'), 4)
+
+    def test_repository_docs_match_current_history_and_model_bar_ui(self):
+        project_dir = MODULE_PATH.parent
+        readme = (project_dir / "README.md").read_text()
+        metrics = (project_dir / "docs" / "METRICS.md").read_text()
+        changelog = (project_dir / "CHANGELOG.md").read_text()
+
+        self.assertIn("chronological quota history", readme)
+        self.assertIn("one shared comparison scale", readme)
+        self.assertIn("quota remaining = 100% - used percentage", metrics)
+        self.assertIn("## 0.2.2 - 2026-07-10", changelog)
+        self.assertNotIn("Quota cost by model", readme)
 
     def test_production_script_has_no_mutating_reset_path(self):
         source = MODULE_PATH.read_text()

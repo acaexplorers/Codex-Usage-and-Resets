@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.2 - 2026-07-10
+
+### Changed
+
+- Restored the full chronological quota-history chart directly beneath the history-range controls
+- Added distinct 5-hour and Weekly history views based on their real account-wide samples
+- Displayed quota remaining from 100% toward 0%, with gaps for recovery or missing activity
+- Moved 5-hour and Weekly drain comparisons back into each model's progress-bar group
+- Put every model drain bar on one shared visual scale while keeping period rankings separate
+- Updated repository screenshots and metric documentation to match the current report
+
+### Removed
+
+- Removed the single projected-line comparison and interval dropdown
+- Removed the separate quota-drain comparison panel
+
 ## 0.2.1 - 2026-07-09
 
 ### Added
