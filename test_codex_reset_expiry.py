@@ -421,13 +421,16 @@ class CodexResetExpiryTests(unittest.TestCase):
     def test_model_report_attributes_positive_deltas_without_counting_window_resets(self):
         events = [
             self.history_event(
-                "2026-07-08T12:00:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 10, 1000
+                "2026-07-08T12:00:00Z", "gpt-5.5", 100_000, 90_000, 60_000, 10_000, 4_000, 10, 1000,
+                secondary_used=40,
             ),
             self.history_event(
-                "2026-07-08T12:05:00Z", "gpt-5.5", 200_000, 180_000, 120_000, 20_000, 8_000, 12, 1000
+                "2026-07-08T12:05:00Z", "gpt-5.5", 200_000, 180_000, 120_000, 20_000, 8_000, 12, 1000,
+                secondary_used=41,
             ),
             self.history_event(
-                "2026-07-08T12:10:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 15, 1000
+                "2026-07-08T12:10:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 15, 1000,
+                secondary_used=43,
             ),
             self.history_event(
                 "2026-07-08T17:00:00Z", "gpt-5.6-codex", 100_000, 90_000, 45_000, 10_000, 3_000, 1, 3000
@@ -447,16 +450,39 @@ class CodexResetExpiryTests(unittest.TestCase):
         self.assertEqual(by_model["gpt-5.5"]["totalTokens"], 300_000)
         self.assertEqual(by_model["gpt-5.5"]["primaryDelta"], 2.0)
         self.assertAlmostEqual(by_model["gpt-5.5"]["primaryPerMillion"], 6.6667, places=3)
+        self.assertEqual(
+            by_model["gpt-5.5"]["quotaCost"]["fiveHour"]["recordedTokensPerQuotaPoint"],
+            150_000,
+        )
+        self.assertAlmostEqual(
+            by_model["gpt-5.5"]["quotaCost"]["fiveHour"]["quotaPointsPerMillionRecordedTokens"],
+            6.6667,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            by_model["gpt-5.5"]["quotaCost"]["weekly"]["quotaPointsPerMillionRecordedTokens"],
+            3.3333,
+            places=3,
+        )
+        self.assertEqual(
+            by_model["gpt-5.5"]["quotaCost"]["weekly"]["recordedTokensPerQuotaPoint"],
+            300_000,
+        )
         self.assertEqual(by_model["gpt-5.6-codex"]["totalTokens"], 300_000)
         self.assertEqual(by_model["gpt-5.6-codex"]["primaryDelta"], 4.0)
         self.assertAlmostEqual(by_model["gpt-5.6-codex"]["primaryPerMillion"], 13.3333, places=3)
+        self.assertAlmostEqual(
+            by_model["gpt-5.6-codex"]["quotaCost"]["weekly"]["quotaPointsPerMillionRecordedTokens"],
+            6.6667,
+            places=3,
+        )
         self.assertEqual(report["currentModel"], "gpt-5.6-codex")
         self.assertNotEqual(by_model["gpt-5.5"]["color"], by_model["gpt-5.6-codex"]["color"])
         self.assertEqual(
             [point["usedPercent"] for point in report["timeline"]],
             [10.0, 12.0, 15.0, 1.0, 2.0],
         )
-        self.assertEqual(report["timelineDays"], 7)
+        self.assertEqual(report["timelineDays"], 30)
         self.assertEqual(report["localHistoryDays"], 1)
         self.assertEqual(report["localHistoryStart"], "2026-07-08T12:00:00+00:00")
         self.assertEqual(report["knownModelTokenPercent"], 100.0)
@@ -485,9 +511,15 @@ class CodexResetExpiryTests(unittest.TestCase):
         self.assertIn("Model usage", dashboard)
         self.assertIn("gpt-5.6-codex", dashboard)
         self.assertIn("Recorded token volume", dashboard)
-        self.assertIn("5h quota burn / 1M tokens", dashboard)
+        self.assertIn("Quota cost by model", dashboard)
+        self.assertIn("5-hour quota cost", dashboard)
+        self.assertIn("Weekly quota cost", dashboard)
+        self.assertIn("1 quota point every", dashboard)
+        self.assertIn("pts / 1M tokens", dashboard)
+        self.assertIn("early sample", dashboard)
         self.assertIn("Metric definitions", dashboard)
         self.assertIn("Quota trajectory", dashboard)
+        self.assertIn("Last 30 days requested · 1 day available locally", dashboard)
         self.assertIn("<svg", dashboard)
         self.assertIn("Export JSON", dashboard)
         self.assertIn('download="codex-model-usage-report.json"', dashboard)
@@ -524,7 +556,8 @@ class CodexResetExpiryTests(unittest.TestCase):
         self.assertIn('data-history-range="90"', dashboard)
         self.assertIn('data-history-range="0"', dashboard)
         self.assertIn("history.replaceState", dashboard)
-        self.assertIn("days available locally", dashboard)
+        self.assertIn("available locally", dashboard)
+        self.assertEqual(dashboard.count("Quota cost by model"), 4)
 
     def test_history_ranges_apply_distinct_local_cutoffs(self):
         events = [
@@ -549,6 +582,27 @@ class CodexResetExpiryTests(unittest.TestCase):
         self.assertEqual(reports[90]["totalTokens"], 600_000)
         self.assertEqual(reports[0]["totalTokens"], reports[90]["totalTokens"])
         self.assertEqual(reports[90]["localHistoryDays"], reports[0]["localHistoryDays"])
+        self.assertEqual(reports[7]["timelineDays"], 7)
+        self.assertEqual(reports[30]["timelineDays"], 30)
+        self.assertEqual(reports[90]["timelineDays"], 90)
+        self.assertEqual(reports[0]["timelineDays"], reports[0]["localHistoryDays"])
+        self.assertEqual(
+            [point["timestamp"] for point in reports[7]["timeline"]],
+            ["2026-07-08T12:00:00+00:00"],
+        )
+        self.assertEqual(
+            [point["timestamp"] for point in reports[30]["timeline"]],
+            ["2026-06-20T12:00:00+00:00", "2026-07-08T12:00:00+00:00"],
+        )
+        self.assertEqual(
+            [point["timestamp"] for point in reports[90]["timeline"]],
+            [
+                "2026-04-20T12:00:00+00:00",
+                "2026-06-20T12:00:00+00:00",
+                "2026-07-08T12:00:00+00:00",
+            ],
+        )
+        self.assertEqual(reports[0]["timeline"], reports[90]["timeline"])
 
     def test_production_script_has_no_mutating_reset_path(self):
         source = MODULE_PATH.read_text()

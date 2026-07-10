@@ -16,8 +16,8 @@ Canonical repository: [acaexplorers/Codex-Usage-and-Resets](https://github.com/a
 ## Suggested Release
 
 ```text
-Tag: v0.2.0
-Title: Model usage history and quota comparison
+Tag: v0.2.1
+Title: Five-hour and weekly quota cost by model
 ```
 
 Release notes:
@@ -27,7 +27,9 @@ Release notes:
 
 - Per-model token history from local Codex rollout records
 - 7d, 30d, 90d, and all-history report views
-- Five-hour quota trajectory and observed burn per million tokens
+- Range-aware five-hour quota trajectory
+- Ranked 5-hour and weekly quota cost by model
+- Readable `1 quota point every X tokens` estimates and sample sizes
 - Cached-input, model-response, and sample-size context
 - Sanitized JSON export
 - Latest model and reasoning effort in the menu-bar menu
@@ -48,7 +50,8 @@ It now tracks:
 - every reset credit and its expiry
 - model-specific recorded token volume
 - cached-input share
-- observed 5-hour quota burn per 1M tokens
+- ranked 5-hour and weekly quota cost by model
+- readable tokens-per-quota-point estimates and sample sizes
 - 7d / 30d / 90d / all-history trends
 
 It can also export a sanitized JSON report for analysis or product feedback.

@@ -746,6 +746,36 @@ def build_model_usage_report(
         stats["secondaryPerMillion"] = round(
             (stats["secondaryDelta"] / model_tokens) * 1_000_000, 4
         ) if model_tokens else None
+        stats["quotaCost"] = {
+            "fiveHour": {
+                "quotaPointsObserved": stats["primaryDelta"],
+                "positiveIncreaseEvents": stats["primaryDeltaEvents"],
+                "quotaPointsPerMillionRecordedTokens": (
+                    stats["primaryPerMillion"]
+                    if stats["primaryDeltaEvents"] > 0
+                    else None
+                ),
+                "recordedTokensPerQuotaPoint": (
+                    round(model_tokens / stats["primaryDelta"])
+                    if stats["primaryDeltaEvents"] > 0 and stats["primaryDelta"] > 0
+                    else None
+                ),
+            },
+            "weekly": {
+                "quotaPointsObserved": stats["secondaryDelta"],
+                "positiveIncreaseEvents": stats["secondaryDeltaEvents"],
+                "quotaPointsPerMillionRecordedTokens": (
+                    stats["secondaryPerMillion"]
+                    if stats["secondaryDeltaEvents"] > 0
+                    else None
+                ),
+                "recordedTokensPerQuotaPoint": (
+                    round(model_tokens / stats["secondaryDelta"])
+                    if stats["secondaryDeltaEvents"] > 0 and stats["secondaryDelta"] > 0
+                    else None
+                ),
+            },
+        }
         stats["efforts"] = [
             {"name": name, "responses": count}
             for name, count in sorted(
@@ -761,14 +791,24 @@ def build_model_usage_report(
     for stats in models:
         stats["color"] = color_by_model[stats["model"]]
 
+    local_history_start = min(all_timestamps) if all_timestamps else None
+    local_history_end = max(all_timestamps) if all_timestamps else None
+    local_history_seconds = (
+        max(0.0, (now - local_history_start).total_seconds())
+        if local_history_start
+        else 0.0
+    )
+    local_history_days = (
+        max(1, int((local_history_seconds + 86_399) // 86_400))
+        if local_history_start
+        else 0
+    )
+
     timeline: list[dict[str, Any]] = []
     latest_primary_identity = None
-    timeline_days = min(history_days, 7) if history_days > 0 else 7
-    timeline_cutoff = now - timedelta(days=timeline_days)
+    timeline_days = history_days if history_days > 0 else local_history_days
     raw_points = []
     for timestamp, event in selected:
-        if timestamp < timeline_cutoff:
-            continue
         identity = history_window_identity(event, "primary")
         window = event.get("primary")
         if identity is None or not isinstance(window, dict):
@@ -802,19 +842,6 @@ def build_model_usage_report(
         else:
             compressed.append(point)
     timeline = sample_timeline(compressed, limit=240)
-
-    local_history_start = min(all_timestamps) if all_timestamps else None
-    local_history_end = max(all_timestamps) if all_timestamps else None
-    local_history_seconds = (
-        max(0.0, (now - local_history_start).total_seconds())
-        if local_history_start
-        else 0.0
-    )
-    local_history_days = (
-        max(1, int((local_history_seconds + 86_399) // 86_400))
-        if local_history_start
-        else 0
-    )
 
     return {
         "schemaVersion": 1,
@@ -1235,7 +1262,140 @@ def format_quota_rate(value: Any, delta_events: int) -> str:
     numeric = safe_float(value)
     if numeric is None or delta_events <= 0:
         return "Collecting data"
-    return f"{numeric:.2f} pp / 1M tokens"
+    return f"{numeric:.2f} pts / 1M tokens"
+
+
+def model_quota_cost(model: dict[str, Any], period: str) -> dict[str, Any]:
+    quota_cost = model.get("quotaCost")
+    quota_cost = quota_cost if isinstance(quota_cost, dict) else {}
+    cost = quota_cost.get(period)
+    cost = cost if isinstance(cost, dict) else {}
+    if period == "fiveHour":
+        fallback_rate = model.get("primaryPerMillion")
+        fallback_points = model.get("primaryDelta")
+        fallback_events = model.get("primaryDeltaEvents")
+    else:
+        fallback_rate = model.get("secondaryPerMillion")
+        fallback_points = model.get("secondaryDelta")
+        fallback_events = model.get("secondaryDeltaEvents")
+    rate = safe_float(cost.get("quotaPointsPerMillionRecordedTokens"))
+    if rate is None:
+        rate = safe_float(fallback_rate)
+    points = safe_float(cost.get("quotaPointsObserved"))
+    if points is None:
+        points = safe_float(fallback_points) or 0.0
+    events = safe_int(cost.get("positiveIncreaseEvents"))
+    if events == 0:
+        events = safe_int(fallback_events)
+    tokens_per_point = safe_int(cost.get("recordedTokensPerQuotaPoint"))
+    if tokens_per_point == 0 and rate is not None and rate > 0 and events > 0:
+        tokens_per_point = round(1_000_000 / rate)
+    available = rate is not None and rate > 0 and events > 0 and tokens_per_point > 0
+    return {
+        "available": available,
+        "rate": rate,
+        "points": points,
+        "events": events,
+        "tokensPerPoint": tokens_per_point,
+    }
+
+
+def quota_sample_copy(cost: dict[str, Any]) -> str:
+    if not cost.get("available"):
+        return "No observed quota increases in this range"
+    points = safe_float(cost.get("points")) or 0.0
+    events = safe_int(cost.get("events"))
+    point_word = "point" if points == 1 else "points"
+    copy = f"{points:g} {point_word} observed across {events:,} increases"
+    if points < 25:
+        copy += " · early sample"
+    return copy
+
+
+def render_quota_cost_comparison(
+    models: list[dict[str, Any]],
+    history_days: int,
+) -> str:
+    costs_by_period = {
+        period: {
+            str(model.get("model") or "Unknown"): model_quota_cost(model, period)
+            for model in models
+        }
+        for period in ("fiveHour", "weekly")
+    }
+    ranks: dict[str, dict[str, int]] = {}
+    for period, costs in costs_by_period.items():
+        ranked = sorted(
+            (
+                (name, cost)
+                for name, cost in costs.items()
+                if cost.get("available")
+            ),
+            key=lambda item: (-(safe_float(item[1].get("rate")) or 0.0), item[0].lower()),
+        )
+        ranks[period] = {name: index for index, (name, _cost) in enumerate(ranked, start=1)}
+
+    def ordering(model: dict[str, Any]) -> tuple[Any, ...]:
+        name = str(model.get("model") or "Unknown")
+        return (
+            ranks["fiveHour"].get(name, 10_000),
+            ranks["weekly"].get(name, 10_000),
+            -safe_int(model.get("totalTokens")),
+            name.lower(),
+        )
+
+    def cost_cell(name: str, period: str, label: str) -> str:
+        cost = costs_by_period[period][name]
+        rank = ranks[period].get(name)
+        if not cost.get("available"):
+            return f"""
+              <div class="quota-cost-cell no-sample" data-label="{html_escape(label)}">
+                <strong>Collecting data</strong>
+                <span>{html_escape(quota_sample_copy(cost))}</span>
+              </div>
+            """
+        rank_copy = f"#{rank} fastest" if rank == 1 else f"#{rank}"
+        return f"""
+          <div class="quota-cost-cell" data-label="{html_escape(label)}">
+            <span class="quota-rank{' fastest' if rank == 1 else ''}">{rank_copy}</span>
+            <strong>1 quota point every {format_token_count(safe_int(cost.get('tokensPerPoint')))} tokens</strong>
+            <span>{html_escape(format_quota_rate(cost.get('rate'), safe_int(cost.get('events'))))}</span>
+            <span>{html_escape(quota_sample_copy(cost))}</span>
+          </div>
+        """
+
+    rows = []
+    for model in sorted(models, key=ordering):
+        name = str(model.get("model") or "Unknown")
+        color = str(model.get("color") or model_color(name))
+        rows.append(
+            f"""
+            <div class="quota-cost-row">
+              <div class="quota-cost-model">
+                <i style="background:{html_escape(color)}"></i>
+                <strong>{html_escape(name)}</strong>
+              </div>
+              {cost_cell(name, "fiveHour", "5-hour quota")}
+              {cost_cell(name, "weekly", "Weekly quota")}
+            </div>
+            """
+        )
+
+    return f"""
+      <section class="quota-comparison" aria-labelledby="quota-cost-heading-{history_days}">
+        <div class="quota-comparison-heading">
+          <div>
+            <h3 id="quota-cost-heading-{history_days}">Quota cost by model</h3>
+            <p>Lower tokens per quota point means faster drain. One point equals 1% on that usage gauge.</p>
+          </div>
+          <span>Observed estimate</span>
+        </div>
+        <div class="quota-cost-header" aria-hidden="true">
+          <span>Model</span><span>5-hour quota</span><span>Weekly quota</span>
+        </div>
+        {"".join(rows)}
+      </section>
+    """
 
 
 def render_quota_timeline_svg(
@@ -1358,11 +1518,13 @@ def render_model_usage_section(
     models = models if isinstance(models, list) else []
     history_days = safe_int(model_report.get("historyDays"))
     local_history_days = safe_int(model_report.get("localHistoryDays"))
+    local_day_word = "day" if local_history_days == 1 else "days"
     if history_days == 0:
-        range_label = f"All local history · {local_history_days} days available"
+        range_label = f"All local history · {local_history_days} {local_day_word} available"
     elif local_history_days and local_history_days < history_days:
         range_label = (
-            f"Last {history_days} days requested · {local_history_days} days available locally"
+            f"Last {history_days} days requested · "
+            f"{local_history_days} {local_day_word} available locally"
         )
     else:
         range_label = f"Last {history_days} days"
@@ -1427,15 +1589,22 @@ def render_model_usage_section(
             <p>{html_escape(empty_copy)}</p>
           </section>
         """
+        quota_comparison = ""
     else:
         max_tokens = max(safe_int(model.get("totalTokens")) for model in models) or 1
-        quota_rates = [
-            safe_float(model.get("primaryPerMillion"))
+        five_hour_rates = [
+            safe_float(model_quota_cost(model, "fiveHour").get("rate"))
             for model in models
-            if safe_float(model.get("primaryPerMillion")) is not None
-            and safe_int(model.get("primaryDeltaEvents")) > 0
+            if model_quota_cost(model, "fiveHour").get("available")
         ]
-        max_quota_rate = max(quota_rates) if quota_rates else 1.0
+        weekly_rates = [
+            safe_float(model_quota_cost(model, "weekly").get("rate"))
+            for model in models
+            if model_quota_cost(model, "weekly").get("available")
+        ]
+        max_five_hour_rate = max(five_hour_rates) if five_hour_rates else 1.0
+        max_weekly_rate = max(weekly_rates) if weekly_rates else 1.0
+        quota_comparison = render_quota_cost_comparison(models, history_days)
         model_rows = []
         for model in models:
             name = str(model.get("model") or "Unknown")
@@ -1444,11 +1613,18 @@ def render_model_usage_section(
             response_count = safe_int(model.get("responses"))
             response_word = "response" if response_count == 1 else "responses"
             token_width = max(1.5, (total_tokens / max_tokens) * 100) if total_tokens else 0
-            quota_rate = safe_float(model.get("primaryPerMillion"))
-            delta_events = safe_int(model.get("primaryDeltaEvents"))
-            quota_width = (
-                max(1.5, (quota_rate / max_quota_rate) * 100)
-                if quota_rate is not None and delta_events > 0 and max_quota_rate
+            five_hour_cost = model_quota_cost(model, "fiveHour")
+            weekly_cost = model_quota_cost(model, "weekly")
+            five_hour_rate = safe_float(five_hour_cost.get("rate"))
+            weekly_rate = safe_float(weekly_cost.get("rate"))
+            five_hour_width = (
+                max(1.5, (five_hour_rate / max_five_hour_rate) * 100)
+                if five_hour_cost.get("available") and five_hour_rate is not None and max_five_hour_rate
+                else 0
+            )
+            weekly_width = (
+                max(1.5, (weekly_rate / max_weekly_rate) * 100)
+                if weekly_cost.get("available") and weekly_rate is not None and max_weekly_rate
                 else 0
             )
             effort_items = model.get("efforts")
@@ -1459,6 +1635,7 @@ def render_model_usage_section(
                 if isinstance(item, dict) and item.get("name")
             ) or "not recorded"
             primary_delta = safe_float(model.get("primaryDelta")) or 0.0
+            secondary_delta = safe_float(model.get("secondaryDelta")) or 0.0
             model_rows.append(
                 f"""
                 <section class="model-row">
@@ -1475,14 +1652,20 @@ def render_model_usage_section(
                     <strong>{format_token_count(total_tokens)}</strong>
                   </div>
                   <div class="metric-bar-row">
-                    <span>5h quota burn / 1M tokens</span>
-                    <div class="metric-track quota"><i style="width:{quota_width:.2f}%;background:{html_escape(color)}"></i></div>
-                    <strong>{html_escape(format_quota_rate(quota_rate, delta_events))}</strong>
+                    <span>5-hour quota cost</span>
+                    <div class="metric-track quota"><i style="width:{five_hour_width:.2f}%;background:{html_escape(color)}"></i></div>
+                    <strong>{html_escape(format_quota_rate(five_hour_rate, safe_int(five_hour_cost.get('events'))))}</strong>
+                  </div>
+                  <div class="metric-bar-row">
+                    <span>Weekly quota cost</span>
+                    <div class="metric-track quota"><i style="width:{weekly_width:.2f}%;background:{html_escape(color)}"></i></div>
+                    <strong>{html_escape(format_quota_rate(weekly_rate, safe_int(weekly_cost.get('events'))))}</strong>
                   </div>
                   <div class="model-facts">
                     <span>{safe_float(model.get('cachedShare')) or 0:g}% of input was cached</span>
                     <span>{format_token_count(safe_int(model.get('averageTokens')))} tokens / model response</span>
-                    <span>{primary_delta:g} total 5h quota points observed</span>
+                    <span>{primary_delta:g} 5-hour quota points observed</span>
+                    <span>{secondary_delta:g} weekly quota points observed</span>
                   </div>
                 </section>
                 """
@@ -1490,8 +1673,22 @@ def render_model_usage_section(
         model_content = "".join(model_rows)
 
     timeline = render_quota_timeline_svg(model_report, local_tz)
-    timeline_days = safe_int(model_report.get("timelineDays")) or 7
-    reset_copy = f"Last {timeline_days} days of recorded windows · gaps mark quota resets"
+    timeline_days = safe_int(model_report.get("timelineDays"))
+    if history_days == 0:
+        timeline_range_copy = (
+            f"All {timeline_days} {'day' if timeline_days == 1 else 'days'} "
+            "of locally available windows"
+            if timeline_days
+            else "All locally available windows"
+        )
+    elif local_history_days and local_history_days < history_days:
+        timeline_range_copy = (
+            f"Last {history_days} days requested · "
+            f"{local_history_days} {local_day_word} available locally"
+        )
+    else:
+        timeline_range_copy = f"Last {history_days} days of recorded windows"
+    reset_copy = f"{timeline_range_copy} · gaps mark quota resets"
 
     return f"""
     <section class="history-section">
@@ -1515,6 +1712,8 @@ def render_model_usage_section(
         <div><span>Model coverage</span><strong>{safe_float(model_report.get('knownModelTokenPercent')) or 0:g}%</strong></div>
       </section>
 
+      {quota_comparison}
+
       <section class="history-panel">
         <div class="panel-heading">
           <div>
@@ -1531,8 +1730,10 @@ def render_model_usage_section(
         <dl>
           <div><dt>Recorded tokens</dt><dd>Input plus output tokens reported after each model response. Cached input is included in this total.</dd></div>
           <div><dt>Cached input</dt><dd>The share of input context Codex marked as reused from cache. A high share is normal in long, tool-using tasks.</dd></div>
-          <div><dt>5h quota burn / 1M tokens</dt><dd>Observed increases in the account's 5-hour usage percentage, divided by recorded tokens. Lower may be better after a meaningful sample.</dd></div>
-          <div><dt>Total 5h quota points observed</dt><dd>The sample size behind that rate. Five points means changes such as 20% to 25%; it does not mean five hours or five resets.</dd></div>
+          <div><dt>5-hour quota cost</dt><dd>Observed increases in the 5-hour usage gauge divided by recorded tokens. Fewer tokens per point means faster drain.</dd></div>
+          <div><dt>Weekly quota cost</dt><dd>The same observed calculation using the weekly usage gauge. Its rate and sample are tracked separately.</dd></div>
+          <div><dt>Quota point</dt><dd>One percentage point on a usage gauge, such as a move from 20% used to 21% used.</dd></div>
+          <div><dt>Points observed</dt><dd>The sample behind a cost estimate. Small samples are marked early and should not drive a strong conclusion.</dd></div>
           <div><dt>Model responses</dt><dd>Individual model steps, including tool-call steps. This count is larger than the number of messages or tasks.</dd></div>
           <div><dt>Model coverage</dt><dd>The share of recorded tokens whose rollout entry identified a model. Unknown model entries are kept separate.</dd></div>
         </dl>
@@ -1540,7 +1741,7 @@ def render_model_usage_section(
 
       <div class="model-list">{model_content}</div>
 
-      <p class="method-note"><strong>Methodology:</strong> Actual token counts come from Codex's local per-response records. Quota percentages are rounded, account-wide snapshots, so model attribution is an observed estimate. Overlapping tasks and work on another device can affect the percentage between samples. “pp” means percentage points; for the burn rate, lower is better after you have a meaningful sample.</p>
+      <p class="method-note"><strong>Methodology:</strong> Actual token counts come from Codex's local per-response records. The 5-hour and weekly gauges are rounded, account-wide snapshots, so model attribution is an observed estimate. Overlapping tasks and work on another device can affect the percentage between samples. In the comparison, fewer recorded tokens per quota point means faster observed drain.</p>
     </section>
     """
 
@@ -2021,6 +2222,85 @@ def render_html_dashboard(
       font-size: 17px;
       overflow-wrap: anywhere;
     }}
+    .quota-comparison {{
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      margin: 0 0 14px;
+      padding: 16px 0 4px;
+    }}
+    .quota-comparison-heading {{
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 14px;
+    }}
+    .quota-comparison-heading h3 {{
+      font-size: 17px;
+      letter-spacing: 0;
+      margin: 0 0 4px;
+    }}
+    .quota-comparison-heading p,
+    .quota-comparison-heading > span {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .quota-comparison-heading > span {{ white-space: nowrap; }}
+    .quota-cost-header,
+    .quota-cost-row {{
+      display: grid;
+      grid-template-columns: minmax(140px, .65fr) repeat(2, minmax(250px, 1fr));
+      column-gap: 20px;
+    }}
+    .quota-cost-header {{
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+      text-transform: uppercase;
+      padding: 0 0 8px;
+    }}
+    .quota-cost-row {{
+      align-items: start;
+      border-top: 1px solid var(--line);
+      padding: 12px 0;
+    }}
+    .quota-cost-model {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      padding-top: 3px;
+    }}
+    .quota-cost-model i {{
+      display: inline-block;
+      flex: 0 0 auto;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }}
+    .quota-cost-model strong {{ overflow-wrap: anywhere; }}
+    .quota-cost-cell {{
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }}
+    .quota-cost-cell strong {{
+      font-size: 14px;
+      overflow-wrap: anywhere;
+    }}
+    .quota-cost-cell > span:not(.quota-rank) {{
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }}
+    .quota-rank {{
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }}
+    .quota-rank.fastest {{ color: var(--red); }}
+    .quota-cost-cell.no-sample strong {{ color: var(--muted); }}
     .history-panel {{
       margin-bottom: 14px;
       padding: 18px;
@@ -2205,6 +2485,21 @@ def render_html_dashboard(
         border-bottom: 1px solid var(--line);
       }}
       .history-summary div:last-child {{ border-bottom: 0; }}
+      .quota-comparison-heading {{ display: grid; gap: 6px; }}
+      .quota-comparison-heading > span {{ white-space: normal; }}
+      .quota-cost-header {{ display: none; }}
+      .quota-cost-row {{
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }}
+      .quota-cost-cell {{ padding-left: 18px; }}
+      .quota-cost-cell::before {{
+        content: attr(data-label);
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 750;
+        text-transform: uppercase;
+      }}
       .metric-definitions dl {{ grid-template-columns: 1fr; gap: 12px; }}
       .timeline-chart svg {{ min-height: 180px; }}
       .model-row-head {{ align-items: start; }}

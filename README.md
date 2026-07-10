@@ -9,7 +9,7 @@ It adds a small `C` icon to the menu bar. The menu shows current 5-hour and week
 
 ## Screenshots
 
-![Codex usage report with reset expiry, quota trajectory, and model comparison](docs/images/usage-report.png)
+![Codex usage report with range controls and ranked 5-hour and weekly quota cost](docs/images/usage-report.png)
 
 ![Codex Usage menu-bar menu](docs/images/menu-bar-menu.png)
 
@@ -22,7 +22,7 @@ It adds a small `C` icon to the menu bar. The menu shows current 5-hour and week
 - Per-model recorded input, cached input, output, and reasoning tokens
 - 7-day, 30-day, 90-day, and all-history views in a self-contained HTML report
 - Five-hour quota trajectory with model-colored points and reset gaps
-- Observed quota burn per million recorded tokens for model comparisons
+- Ranked 5-hour and weekly quota cost by model, with readable tokens-per-point estimates
 - Sanitized JSON export for analysis or product feedback
 - Calendar (`.ics`), terminal, and optional SwiftBar/xbar outputs
 - No full Xcode installation required
@@ -55,6 +55,8 @@ open codex-usage-report.html
 
 The generated report is self-contained. Its `7d`, `30d`, `90d`, and `All` controls work without leaving a terminal process running.
 
+Each range changes the model totals **and** the Quota trajectory chart. Longer ranges are downsampled for readability while preserving the selected period, quota-reset gaps, and model colors.
+
 Those ranges describe the Codex records still present on the Mac, not the lifetime of the account. The report prints the earliest and latest local record it found. If only 82 days are available locally, for example, `90d` and `All` will correctly show the same totals while `7d` and `30d` still use their own cutoffs.
 
 For a live local report that refreshes every five minutes:
@@ -71,8 +73,10 @@ The live server binds only to `127.0.0.1`.
 | --- | --- |
 | Recorded tokens | Input plus output tokens in Codex's local per-response records. Cached input is included. |
 | Cached input | The share of input context that Codex marked as reused from cache. A high share is normal in long tool-using tasks. |
-| 5h quota burn / 1M tokens | Positive changes in the account's five-hour usage percentage divided by recorded tokens attributed to that model. |
-| Total 5h quota points observed | The sample size behind the burn rate. Five points means changes such as 20% to 25%, not five hours or five resets. |
+| 5-hour quota cost | Positive changes in the five-hour usage gauge divided by recorded tokens attributed to that model. |
+| Weekly quota cost | The same observed calculation using the weekly gauge. It has its own rate and sample size. |
+| 1 quota point every X tokens | The readable cost estimate. One point is 1% on that gauge; fewer tokens per point means faster quota drain. |
+| Points observed | The sample behind a cost estimate. Five points means changes such as 20% to 25%, not five hours or five resets. |
 | Model responses | Individual model steps, including tool-call steps. This is not the number of user messages or tasks. |
 | Model coverage | The share of recorded tokens whose rollout entry identified a model. |
 
@@ -88,7 +92,7 @@ Use **Export JSON** in the report, or run:
   --quiet
 ```
 
-The export contains aggregate model/token statistics and quota timeline points. It does not contain prompts, messages, task titles, repository paths, authentication tokens, or conversation content.
+The export contains aggregate model/token statistics, separate 5-hour and weekly quota-cost objects, and quota timeline points. It does not contain prompts, messages, task titles, repository paths, authentication tokens, or conversation content.
 
 ## Privacy and Safety
 

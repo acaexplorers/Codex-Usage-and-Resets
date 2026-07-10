@@ -33,6 +33,8 @@ The `7d`, `30d`, and `90d` controls apply time cutoffs to rollout records that s
 
 The report displays the earliest and latest local timestamps it found. When fewer than 90 days remain locally, the `90d` and `All` views will intentionally match. Deleted, rotated, or unavailable rollout files cannot be reconstructed by this utility.
 
+The Quota trajectory follows the same selected range as the model totals. Longer timelines are downsampled to keep the report responsive; the exported JSON contains the same sampled trajectory shown in the chart.
+
 ## Quota-Point Attribution
 
 The five-hour and weekly percentages are account-wide snapshots. The report sorts all local token events by time and compares consecutive snapshots from the same quota window.
@@ -45,16 +47,24 @@ observed quota points = newer used percentage - previous used percentage
 
 Window changes and percentage decreases are treated as resets and are not counted as consumption. This is intentionally conservative.
 
-## Burn Rate
+## Quota Cost Rates
 
-For each model:
+For each model and quota window:
 
 ```text
-5h quota burn per 1M tokens =
+5-hour quota points per 1M tokens =
   observed five-hour quota points / recorded tokens * 1,000,000
+
+weekly quota points per 1M tokens =
+  observed weekly quota points / recorded tokens * 1,000,000
+
+recorded tokens per quota point =
+  recorded tokens / observed quota points
 ```
 
-Lower values may indicate that a model consumes less displayed five-hour quota for the same number of recorded tokens. The comparison becomes more useful as `Total 5h quota points observed` grows.
+The report translates the last value into `1 quota point every X recorded tokens`. One point is one percentage point on that quota's usage gauge. Fewer tokens per point means faster observed quota drain; more tokens per point means slower observed drain.
+
+The 5-hour and weekly rankings are separate because they come from different windows. Each cell includes its own observed point count, and samples below 25 points are marked as early.
 
 ## Important Limitations
 
@@ -81,4 +91,4 @@ Do not draw a strong conclusion from a model with only a few observed quota poin
 
 ## JSON Export
 
-The report export contains aggregate model statistics and a sampled quota timeline. It deliberately excludes authentication data and conversation content. Review it before sharing, because timestamps and model names still describe your usage pattern.
+The report export contains aggregate model statistics, structured `quotaCost.fiveHour` and `quotaCost.weekly` measurements, and a sampled quota timeline. It deliberately excludes authentication data and conversation content. Review it before sharing, because timestamps and model names still describe your usage pattern.

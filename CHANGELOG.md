@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.1 - 2026-07-09
+
+### Added
+
+- Ranked 5-hour and weekly quota-cost comparison by model
+- Readable recorded-tokens-per-quota-point estimates and sample labels
+- Structured 5-hour and weekly `quotaCost` data in the JSON export
+
+### Fixed
+
+- Made the Quota trajectory follow the selected 7d, 30d, 90d, or all-history range
+
 ## 0.2.0 - 2026-07-09
 
 ### Added
@@ -10,7 +22,7 @@ All notable changes to this project are documented here.
 - Private incremental gzip cache with `0600` permissions
 - 7-day, 30-day, 90-day, and all-history report views
 - Five-hour quota trajectory with model-colored points and reset gaps
-- Per-model cached-input share, response count, and observed quota-burn rate
+- Per-model cached-input share, response count, and observed quota-cost rates
 - Sanitized model-usage JSON export
 - Latest model and reasoning effort in the menu-bar menu
 - Metric glossary and methodology documentation
