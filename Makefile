@@ -1,7 +1,9 @@
-.PHONY: test typecheck build safety package
+.PHONY: check test typecheck build safety package
+
+check: test typecheck safety
 
 test:
-	/usr/bin/python3 test_codex_reset_expiry.py
+	/usr/bin/python3 -m unittest -v test_codex_reset_expiry.py
 
 typecheck:
 	swiftc -typecheck CodexUsageMenuBar.swift
@@ -18,4 +20,7 @@ safety:
 
 package:
 	rm -f ../codex-usage-reset-source.zip
-	zip -r ../codex-usage-reset-source.zip . -x "./.git/*" "./.build/*" "./Codex Usage.app/*" "./__pycache__/*" "./*.pyc" "./.DS_Store"
+	zip -r ../codex-usage-reset-source.zip . \
+		-x "./.git/*" "./.build/*" "./Codex Usage.app/*" "./__pycache__/*" \
+		"./*.pyc" "./.DS_Store" "./codex-usage-report.html" \
+		"./codex-model-usage-report.json" "./codex-reset-expiry.ics"

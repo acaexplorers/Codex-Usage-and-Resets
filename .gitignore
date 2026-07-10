@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+.build/
+Codex Usage.app/
+codex-reset-expiry-dashboard.html
+codex-usage-report.html
+codex-model-usage-report.json
+codex-reset-expiry.ics
+*.zip

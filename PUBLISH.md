@@ -1,67 +1,68 @@
 # Publishing
 
-This project is best posted as a small GitHub repository rather than a gist because it has multiple scripts, a Swift source file, and tests.
+Canonical repository: [acaexplorers/Codex-Usage-and-Resets](https://github.com/acaexplorers/Codex-Usage-and-Resets)
 
-## Suggested Repository Name
+## Release Checklist
+
+1. Run `make check`.
+2. Build and open `Codex Usage.app`.
+3. Verify the menu-bar menu and HTML report at desktop and mobile widths.
+4. Confirm all four history ranges switch in the static report.
+5. Confirm JSON export contains no prompt, task, repository, or authentication data.
+6. Update `CHANGELOG.md` and the app version in the build script.
+7. Refresh `docs/images/usage-report.png` and `docs/images/menu-bar-menu.png` after visible changes.
+8. Publish one coherent commit and tag the release.
+
+## Suggested Release
 
 ```text
-codex-usage-reset
+Tag: v0.2.0
+Title: Model usage history and quota comparison
 ```
 
-## Create A Public GitHub Repo
+Release notes:
 
-From this folder:
+```markdown
+## What's new
 
-```bash
-git init
-git add .
-git commit -m "Package Codex usage reset menu app"
-gh repo create codex-usage-reset --public --source=. --remote=origin --push
+- Per-model token history from local Codex rollout records
+- 7d, 30d, 90d, and all-history report views
+- Five-hour quota trajectory and observed burn per million tokens
+- Cached-input, model-response, and sample-size context
+- Sanitized JSON export
+- Latest model and reasoning effort in the menu-bar menu
+- Clearer reset expiry/countdown labels
+
+The collector is local and read-only. It retains no prompt or conversation text, and reset redemption remains available only in the official Codex app.
+
+The Codex backend and rollout formats are unofficial interfaces and may change.
 ```
 
-Use `--private` instead of `--public` if you want to review it on GitHub first.
+## Announcement Draft
 
-## Create A Source Zip
+I built a read-only macOS menu-bar utility for Codex usage and resets.
 
-```bash
-git archive --format=zip --output ../codex-usage-reset-source.zip HEAD
-```
+It now tracks:
 
-If you have not made a git commit yet:
+- 5-hour and weekly usage
+- every reset credit and its expiry
+- model-specific recorded token volume
+- cached-input share
+- observed 5-hour quota burn per 1M tokens
+- 7d / 30d / 90d / all-history trends
 
-```bash
-ditto -c -k --sequesterRsrc --keepParent . ../codex-usage-reset-source.zip
-```
+It can also export a sanitized JSON report for analysis or product feedback.
 
-## Short Post Draft
+No full Xcode install required. It builds with Apple Command Line Tools and uses the Codex login already on your Mac.
 
-I made a small read-only macOS menu-bar helper for Codex usage resets.
+Important caveat: quota percentages are rounded and account-wide, so model comparisons are observed estimates, not billing data.
 
-It shows:
+https://github.com/acaexplorers/Codex-Usage-and-Resets
 
-- 5 hour usage remaining
-- weekly usage remaining
-- available reset count
-- each reset's expiry time
-- time left before each reset expires
+## Short Announcement
 
-No Xcode required. It builds with Apple's Command Line Tools and uses the local Codex login already on your Mac.
+Made a read-only Codex usage monitor for macOS: reset expiries, 5h/weekly limits, model token history, cached-input share, quota trends, and JSON export from one small menu-bar icon.
 
-Important: it is read-only. It does not redeem resets. Use the official Codex app for that.
+No full Xcode required. No reset redemption. Local history retains no prompt text.
 
-## Longer Post Draft
-
-I wrapped up a tiny local helper for Codex reset visibility on macOS.
-
-The official app shows usage, but I wanted a clearer view of banked reset expiry dates so I would not accidentally let one expire. This gives me a small menu-bar `C` icon with 5 hour usage, weekly usage, available reset count, and each reset's expiry/time-left.
-
-It is intentionally read-only:
-
-- reads the local Codex auth file
-- calls Codex usage/reset endpoints
-- does not include a reset redemption endpoint
-- does not print or store tokens
-
-It can also run as a terminal checker, local browser dashboard, or SwiftBar plugin.
-
-The backend endpoints are unofficial and may change, so treat this as a small personal utility rather than a stable API client.
+https://github.com/acaexplorers/Codex-Usage-and-Resets

@@ -1,43 +1,42 @@
-# Codex Usage Reset
+# Codex Usage and Resets
 
-A small read-only macOS helper for checking Codex usage and banked reset expiry times.
+A read-only macOS menu-bar utility for Codex usage limits, reset-credit expiry, and local model/token statistics.
 
-It can run as:
+It adds a small `C` icon to the menu bar. The menu shows current 5-hour and weekly usage, the latest model, and every available reset. The browser report adds model comparisons, recent quota trajectories, history ranges, and a sanitized JSON export.
 
-- a native macOS menu-bar app with a small `C` icon
-- a terminal checker
-- a local browser dashboard
-- an optional SwiftBar/xbar plugin
+> [!IMPORTANT]
+> This is an independent utility, not an official OpenAI product. The Codex backend endpoints it reads are not a public stable API and may change.
 
-## What It Shows
+## Screenshots
 
-- 5 hour Codex usage remaining
-- weekly Codex usage remaining
-- available reset count
-- each available reset's expiry time
-- each reset's time left
+![Codex usage report with reset expiry, quota trajectory, and model comparison](docs/images/usage-report.png)
 
-## Safety
+![Codex Usage menu-bar menu](docs/images/menu-bar-menu.png)
 
-This project reads your local Codex auth file at `~/.codex/auth.json` and calls read-only Codex backend endpoints:
+## Highlights
 
-```text
-https://chatgpt.com/backend-api/wham/rate-limit-reset-credits
-https://chatgpt.com/backend-api/wham/usage
-```
+- Native macOS menu-bar app with no Dock icon or main window
+- 5-hour and weekly usage remaining, with reset times
+- Every available reset credit, its exact expiry, and a countdown from the snapshot time
+- Latest local model and reasoning effort
+- Per-model recorded input, cached input, output, and reasoning tokens
+- 7-day, 30-day, 90-day, and all-history views in a self-contained HTML report
+- Five-hour quota trajectory with model-colored points and reset gaps
+- Observed quota burn per million recorded tokens for model comparisons
+- Sanitized JSON export for analysis or product feedback
+- Calendar (`.ics`), terminal, and optional SwiftBar/xbar outputs
+- No full Xcode installation required
 
-It does not contain or call a reset redemption endpoint. Redeem resets only in the official Codex app.
+## Quick Start
 
-These endpoints are not a public stable API. They can change or stop working.
+1. Download or clone the repository on a Mac where Codex Desktop is already signed in.
+2. Double-click `build-codex-menubar-app.command`.
+3. Open `Codex Usage.app`.
+4. Click the small `C` icon in the macOS menu bar.
 
-## Requirements
+The first model-history report may take several seconds while it indexes existing local Codex rollout files. Later reports are incremental and only read newly appended data.
 
-- macOS 13 or newer for the native menu-bar app
-- Codex Desktop signed in on the same Mac
-- Python 3 at `/usr/bin/python3`
-- Apple's Command Line Tools for the native app build
-
-If `swiftc` is missing, install Command Line Tools:
+If `swiftc` is missing, install Apple's Command Line Tools:
 
 ```bash
 xcode-select --install
@@ -45,89 +44,140 @@ xcode-select --install
 
 Full Xcode is not required.
 
-## Native Menu-Bar App
+## Usage Report
 
-Build it:
-
-```bash
-./build-codex-menubar-app.command
-```
-
-Then open:
-
-```text
-Codex Usage.app
-```
-
-The app has no Dock icon and no main window. Look for a small `C` icon in the macOS menu bar. Click it to see usage and reset expiry details.
-
-The default build targets the current Mac architecture. To try a universal build:
+Choose **Open Usage Report** from the menu-bar menu, or run:
 
 ```bash
-UNIVERSAL=1 ./build-codex-menubar-app.command
+/usr/bin/python3 codex-reset-expiry.py --html codex-usage-report.html
+open codex-usage-report.html
 ```
 
-## Terminal Checker
+The generated report is self-contained. Its `7d`, `30d`, `90d`, and `All` controls work without leaving a terminal process running.
 
-```bash
-/usr/bin/python3 codex-reset-expiry.py --pretty
-```
+Those ranges describe the Codex records still present on the Mac, not the lifetime of the account. The report prints the earliest and latest local record it found. If only 82 days are available locally, for example, `90d` and `All` will correctly show the same totals while `7d` and `30d` still use their own cutoffs.
 
-Or double-click:
-
-```text
-check-codex-reset-expiry.command
-```
-
-## Browser Dashboard
+For a live local report that refreshes every five minutes:
 
 ```bash
 /usr/bin/python3 codex-reset-expiry.py --serve --open
 ```
 
-Or double-click:
+The live server binds only to `127.0.0.1`.
 
-```text
-open-codex-reset-expiry-dashboard.command
+## Metric Guide
+
+| Metric | Meaning |
+| --- | --- |
+| Recorded tokens | Input plus output tokens in Codex's local per-response records. Cached input is included. |
+| Cached input | The share of input context that Codex marked as reused from cache. A high share is normal in long tool-using tasks. |
+| 5h quota burn / 1M tokens | Positive changes in the account's five-hour usage percentage divided by recorded tokens attributed to that model. |
+| Total 5h quota points observed | The sample size behind the burn rate. Five points means changes such as 20% to 25%, not five hours or five resets. |
+| Model responses | Individual model steps, including tool-call steps. This is not the number of user messages or tasks. |
+| Model coverage | The share of recorded tokens whose rollout entry identified a model. |
+
+The quota percentage is rounded and account-wide. Model attribution is therefore an observed estimate, especially when tasks overlap or Codex is used on another device. Treat small samples as preliminary. See [docs/METRICS.md](docs/METRICS.md) for the calculation and limitations.
+
+## JSON Export
+
+Use **Export JSON** in the report, or run:
+
+```bash
+/usr/bin/python3 codex-reset-expiry.py \
+  --model-json codex-model-usage-report.json \
+  --quiet
 ```
 
-This starts a read-only local server on `127.0.0.1`.
+The export contains aggregate model/token statistics and quota timeline points. It does not contain prompts, messages, task titles, repository paths, authentication tokens, or conversation content.
 
-## Calendar Reminders
+## Privacy and Safety
 
-Generate an `.ics` file with reminders before reset expiry:
+The utility uses two local data sources:
+
+1. `~/.codex/auth.json` to authenticate read-only requests for current usage and reset-credit details.
+2. `~/.codex/sessions` and `~/.codex/archived_sessions` to read model names, token counters, and quota snapshots already written by Codex.
+
+The incremental history cache is stored at:
+
+```text
+~/.codex/codex-usage-reset-history-v1.json.gz
+```
+
+It is created with mode `0600` and retains only timestamps, model/effort labels, token counters, and quota snapshots. No conversation text is copied into the cache.
+
+The project calls these read-only endpoints:
+
+```text
+https://chatgpt.com/backend-api/wham/rate-limit-reset-credits
+https://chatgpt.com/backend-api/wham/usage
+```
+
+There is no reset-redemption request in this project. Redeem resets only in the official Codex app. See [SECURITY.md](SECURITY.md) for the security model and verification commands.
+
+## Requirements
+
+- macOS 13 or newer for the native menu-bar app
+- Codex Desktop signed in on the same Mac
+- Python 3 at `/usr/bin/python3`
+- Apple Command Line Tools for building the native app
+
+The default build targets the current Mac architecture. To attempt a universal Intel/Apple Silicon build:
+
+```bash
+UNIVERSAL=1 ./build-codex-menubar-app.command
+```
+
+## Other Commands
+
+Terminal report:
+
+```bash
+/usr/bin/python3 codex-reset-expiry.py --pretty
+```
+
+Calendar reminders (72, 24, and 6 hours before expiry by default):
 
 ```bash
 /usr/bin/python3 codex-reset-expiry.py --ics codex-reset-expiry.ics
 ```
 
-The default reminders are 72, 24, and 6 hours before expiry.
-
-## SwiftBar Or xbar
-
-Install SwiftBar:
+Optional SwiftBar/xbar plugin:
 
 ```bash
 brew install --cask swiftbar
-```
-
-Then run:
-
-```bash
 ./install-codex-menubar-widget.command
 ```
 
-The plugin refreshes every 5 minutes.
+## Development
 
-## Tests
+Run the complete local check:
 
 ```bash
-/usr/bin/python3 test_codex_reset_expiry.py
-swiftc -typecheck CodexUsageMenuBar.swift
+make check
 ```
+
+Or run each check separately:
+
+```bash
+/usr/bin/python3 -m unittest -v test_codex_reset_expiry.py
+swiftc -typecheck CodexUsageMenuBar.swift
+make safety
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## Troubleshooting
 
-If the menu-bar icon is running but not visible, your menu bar may be crowded or a menu-bar manager may have hidden it. Look for an item named `Codex Usage`.
+**The app is running, but the `C` icon is missing.** Your menu bar may be full or a menu-bar manager may be hiding it. Close or hide another status item, then reopen `Codex Usage.app`.
 
-If macOS blocks a downloaded `.command` file, run it from Terminal instead.
+**The report takes a while the first time.** The initial pass indexes existing rollout files. Later runs use byte offsets from the private incremental cache.
+
+**`90d` and `All` show the same totals.** This is expected when fewer than 90 days of Codex records remain on the Mac. Check the **Local records** date span shown above the range controls.
+
+**macOS blocks a downloaded `.command` file.** In Finder, Control-click it and choose **Open**, or run the command from Terminal.
+
+**Usage or reset data stopped loading.** The read-only backend endpoints are unofficial and may have changed. Open an issue with the error text, but never attach `~/.codex/auth.json`.
+
+## License
+
+[MIT](LICENSE)

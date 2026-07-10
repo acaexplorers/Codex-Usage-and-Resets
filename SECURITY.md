@@ -1,20 +1,59 @@
 # Security
 
-This helper is intentionally read-only.
+## Security Model
 
-It reads `~/.codex/auth.json` to use the same local Codex login as the Codex Desktop app. It does not store tokens, print tokens, send tokens anywhere except the Codex backend endpoints it calls, or include a reset redemption endpoint.
+This utility is intentionally read-only.
 
-Before publishing or changing this project, run:
+It reads `~/.codex/auth.json` to use the same local Codex login as Codex Desktop. The token is used only in `Authorization` headers sent to the two configured `chatgpt.com` read endpoints. It is not printed, copied into reports, or written to the history cache.
 
-```bash
-rg -n "rate-limit-reset-credits/consume|redeem_request_id|\\.post\\(|access_token|refresh_token|id_token" .
+The model-history collector reads local rollout JSONL files. It retains only:
+
+- event timestamps
+- model and reasoning-effort labels
+- input, cached-input, output, reasoning, and total token counters
+- five-hour and weekly quota snapshots
+
+It does not retain prompts, messages, conversation content, tool output, task titles, workspace paths, or repository names.
+
+The incremental cache is `~/.codex/codex-usage-reset-history-v1.json.gz`. It is written atomically with mode `0600`.
+
+## Network Access
+
+The utility calls:
+
+```text
+GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits
+GET https://chatgpt.com/backend-api/wham/usage
 ```
 
-Expected matches:
+These are not public stable APIs and may change.
 
-- `access_token` inside `codex-reset-expiry.py`, where the token is read from the local Codex auth file
-- `access_token` in the test that verifies UI payloads do not expose tokens
+There is no HTTP POST request and no reset-credit consumption or redemption path. Reset actions belong in the official Codex app.
 
-There should be no `consume` endpoint, no `redeem_request_id`, and no HTTP POST reset call.
+## Exports
 
-These Codex backend endpoints are not a public stable API and may change.
+The model JSON export is sanitized and contains aggregate statistics plus sampled timestamps/model labels for the quota chart. It contains no authentication data or conversation text.
+
+Usage timestamps and model names can still reveal behavioral patterns. Review an export before sharing it publicly.
+
+## Verification
+
+Run:
+
+```bash
+make safety
+```
+
+The safety target scans executable sources for reset-consumption paths, redemption request IDs, and HTTP POST calls.
+
+Also run the full test suite:
+
+```bash
+make check
+```
+
+Tests verify that synthetic prompt and message text never enters collected history events.
+
+## Reporting A Vulnerability
+
+Open a private security advisory in the GitHub repository when possible. Do not include Codex authentication files, access tokens, raw rollout files, or real conversation content in a report.

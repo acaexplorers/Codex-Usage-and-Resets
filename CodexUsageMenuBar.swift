@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var summary: [String: Any]?
     private var errorMessage: String?
+    private var reportIsBuilding = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -89,6 +90,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        if let model = summary["model"] as? [String: Any],
+           let name = model["name"] as? String {
+            parts.append(name)
+        }
+
         let available = resets["availableCount"] as? Int ?? 0
         parts.append("\(available) resets")
 
@@ -169,6 +175,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 addInfo("Resets \(resetsAt)", to: menu, color: NSColor.secondaryLabelColor)
             }
 
+            if let model = summary["model"] as? [String: Any],
+               let name = model["name"] as? String {
+                menu.addItem(NSMenuItem.separator())
+                addInfo("Latest model: \(name)", to: menu, weight: .semibold)
+                if let effort = model["effort"] as? String, !effort.isEmpty {
+                    addInfo("Reasoning effort: \(effort)", to: menu, color: NSColor.secondaryLabelColor)
+                }
+            }
+
             menu.addItem(NSMenuItem.separator())
             let available = resets["availableCount"] as? Int ?? 0
             let resetWord = available == 1 ? "reset" : "resets"
@@ -202,7 +217,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
         addAction("Refresh Now", selector: #selector(refreshNow), key: "r", to: menu)
-        addAction("Open Dashboard Snapshot", selector: #selector(openDashboardSnapshot), key: "o", to: menu)
+        if reportIsBuilding {
+            addInfo("Building Usage Report...", to: menu, color: NSColor.secondaryLabelColor)
+        } else {
+            addAction("Open Usage Report", selector: #selector(openDashboardSnapshot), key: "o", to: menu)
+        }
 
         menu.addItem(NSMenuItem.separator())
         addAction("Quit", selector: #selector(quit), key: "q", to: menu)
@@ -245,12 +264,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openDashboardSnapshot() {
+        guard !reportIsBuilding else { return }
+        reportIsBuilding = true
+        rebuildMenu()
+
         DispatchQueue.global(qos: .utility).async {
             let destination = FileManager.default.temporaryDirectory
-                .appendingPathComponent("codex-reset-expiry-dashboard.html")
-            _ = try? self.runHelper(arguments: ["--html", destination.path, "--quiet"])
+                .appendingPathComponent("codex-usage-report.html")
+            let succeeded: Bool
+            do {
+                _ = try self.runHelper(arguments: ["--html", destination.path, "--quiet"])
+                succeeded = true
+            } catch {
+                succeeded = false
+            }
             DispatchQueue.main.async {
-                NSWorkspace.shared.open(destination)
+                self.reportIsBuilding = false
+                self.rebuildMenu()
+                if succeeded {
+                    NSWorkspace.shared.open(destination)
+                } else {
+                    NSSound.beep()
+                }
             }
         }
     }

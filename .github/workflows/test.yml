@@ -1,0 +1,20 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python tests
+        run: /usr/bin/python3 -m unittest -v test_codex_reset_expiry.py
+      - name: Swift type check
+        run: swiftc -typecheck CodexUsageMenuBar.swift
+      - name: Read-only safety scan
+        run: make safety

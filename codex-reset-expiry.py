@@ -9,19 +9,22 @@ expire. It does not redeem anything.
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 import html
 import http.server
 import json
 import os
 import shutil
 import socketserver
+import sqlite3
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,17 @@ from typing import Any
 RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 RESET_CREDITS_HOST = "chatgpt.com"
+HISTORY_CACHE_VERSION = 1
+DEFAULT_HISTORY_DAYS = 30
+HISTORY_CACHE_NAME = "codex-usage-reset-history-v1.json.gz"
+LEGACY_HISTORY_CACHE_NAME = "codex-usage-reset-history-v1.json"
+TOKEN_FIELDS = (
+    ("input_tokens", "input"),
+    ("cached_input_tokens", "cachedInput"),
+    ("output_tokens", "output"),
+    ("reasoning_output_tokens", "reasoningOutput"),
+    ("total_tokens", "total"),
+)
 
 
 class Style:
@@ -82,6 +96,55 @@ def default_auth_path() -> Path:
     if codex_home:
         return Path(codex_home).expanduser() / "auth.json"
     return Path("~/.codex/auth.json").expanduser()
+
+
+def default_codex_home() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser()
+    return Path("~/.codex").expanduser()
+
+
+def default_history_cache_path(codex_home: Path | None = None) -> Path:
+    return (codex_home or default_codex_home()) / HISTORY_CACHE_NAME
+
+
+def latest_local_model(codex_home: Path | None = None) -> dict[str, Any] | None:
+    codex_home = (codex_home or default_codex_home()).expanduser()
+    database_paths = [
+        codex_home / "state_5.sqlite",
+        codex_home / "sqlite" / "state_5.sqlite",
+    ]
+    for database_path in database_paths:
+        if not database_path.is_file():
+            continue
+        connection = None
+        try:
+            connection = sqlite3.connect(
+                f"file:{database_path}?mode=ro",
+                uri=True,
+                timeout=1,
+            )
+            row = connection.execute(
+                """
+                SELECT model, reasoning_effort
+                FROM threads
+                WHERE model IS NOT NULL AND model <> ''
+                ORDER BY recency_at_ms DESC, updated_at_ms DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        except (OSError, sqlite3.Error):
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+        if row and row[0]:
+            return {
+                "name": str(row[0]),
+                "effort": str(row[1]) if row[1] else None,
+            }
+    return None
 
 
 def load_auth(path: Path) -> tuple[str, str]:
@@ -215,6 +278,603 @@ def parse_usage_windows(payload: dict[str, Any] | None) -> list[UsageWindow]:
     return [window for window in windows if window is not None]
 
 
+def safe_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def discover_rollout_files(codex_home: Path) -> dict[str, Path]:
+    candidates: list[Path] = []
+    sessions = codex_home / "sessions"
+    archived = codex_home / "archived_sessions"
+    if sessions.is_dir():
+        candidates.extend(sessions.rglob("rollout-*.jsonl"))
+    if archived.is_dir():
+        candidates.extend(archived.glob("rollout-*.jsonl"))
+
+    selected: dict[str, Path] = {}
+    for path in candidates:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        key = path.stem
+        existing = selected.get(key)
+        if existing is None:
+            selected[key] = path
+            continue
+        try:
+            existing_stat = existing.stat()
+        except OSError:
+            selected[key] = path
+            continue
+        if (stat.st_size, stat.st_mtime_ns) > (
+            existing_stat.st_size,
+            existing_stat.st_mtime_ns,
+        ):
+            selected[key] = path
+    return selected
+
+
+def rollout_prefix_hash(path: Path) -> str:
+    with path.open("rb") as handle:
+        prefix = handle.read(4096)
+    newline = prefix.find(b"\n")
+    if newline >= 0:
+        prefix = prefix[: newline + 1]
+    return hashlib.sha256(prefix).hexdigest()
+
+
+def compact_rate_window(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    used_percent = safe_float(raw.get("used_percent"))
+    if used_percent is None:
+        return None
+    window_minutes = raw.get("window_minutes")
+    resets_at = raw.get("resets_at")
+    return {
+        "usedPercent": used_percent,
+        "windowMinutes": safe_int(window_minutes) if window_minutes is not None else None,
+        "resetsAt": safe_int(resets_at) if resets_at is not None else None,
+    }
+
+
+def scan_rollout_file(
+    path: Path,
+    session_key: str,
+    start_offset: int = 0,
+    initial_model: str | None = None,
+    initial_effort: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    model = initial_model
+    effort = initial_effort
+    final_offset = max(0, start_offset)
+
+    with path.open("rb") as handle:
+        handle.seek(final_offset)
+        while True:
+            position = handle.tell()
+            line = handle.readline()
+            if not line:
+                final_offset = handle.tell()
+                break
+            if not line.endswith(b"\n"):
+                final_offset = position
+                break
+            final_offset = handle.tell()
+            if b"turn_context" not in line and b"token_count" not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if record.get("type") == "turn_context":
+                raw_model = payload.get("model")
+                raw_effort = payload.get("effort")
+                if isinstance(raw_model, str) and raw_model:
+                    model = raw_model
+                effort = raw_effort if isinstance(raw_effort, str) and raw_effort else None
+                continue
+            if record.get("type") != "event_msg" or payload.get("type") != "token_count":
+                continue
+
+            info = payload.get("info")
+            info = info if isinstance(info, dict) else {}
+            raw_tokens = info.get("last_token_usage")
+            raw_tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
+            tokens = {
+                compact_name: safe_int(raw_tokens.get(source_name))
+                for source_name, compact_name in TOKEN_FIELDS
+            }
+            raw_limits = payload.get("rate_limits")
+            raw_limits = raw_limits if isinstance(raw_limits, dict) else {}
+            primary = compact_rate_window(raw_limits.get("primary"))
+            secondary = compact_rate_window(raw_limits.get("secondary"))
+            if not any(tokens.values()) and primary is None and secondary is None:
+                continue
+
+            timestamp = record.get("timestamp")
+            if not isinstance(timestamp, str) or not timestamp:
+                continue
+            events.append(
+                {
+                    "timestamp": timestamp,
+                    "session": session_key,
+                    "position": position,
+                    "model": model or "Unknown",
+                    "effort": effort,
+                    "tokens": tokens,
+                    "limitId": raw_limits.get("limit_id"),
+                    "primary": primary,
+                    "secondary": secondary,
+                }
+            )
+
+    return events, {"offset": final_offset, "model": model, "effort": effort}
+
+
+def empty_history_cache() -> dict[str, Any]:
+    return {"version": HISTORY_CACHE_VERSION, "files": {}, "events": []}
+
+
+def load_history_cache(path: Path) -> dict[str, Any]:
+    try:
+        if path.suffix == ".gz":
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                cache = json.load(handle)
+        else:
+            cache = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return empty_history_cache()
+    if not isinstance(cache, dict) or cache.get("version") != HISTORY_CACHE_VERSION:
+        return empty_history_cache()
+    if not isinstance(cache.get("files"), dict) or not isinstance(cache.get("events"), list):
+        return empty_history_cache()
+    return cache
+
+
+def save_history_cache(path: Path, cache: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        if path.suffix == ".gz":
+            with gzip.open(
+                temporary,
+                "wt",
+                encoding="utf-8",
+                compresslevel=5,
+            ) as handle:
+                json.dump(cache, handle, separators=(",", ":"))
+        else:
+            temporary.write_text(json.dumps(cache, separators=(",", ":")))
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def collect_model_history(
+    codex_home: Path | None = None,
+    cache_path: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    codex_home = (codex_home or default_codex_home()).expanduser()
+    cache_path = (cache_path or default_history_cache_path(codex_home)).expanduser()
+    default_cache = default_history_cache_path(codex_home)
+    legacy_cache = codex_home / LEGACY_HISTORY_CACHE_NAME
+    if cache_path == default_cache and not cache_path.exists() and legacy_cache.exists():
+        cache = load_history_cache(legacy_cache)
+        save_history_cache(cache_path, cache)
+        try:
+            legacy_cache.unlink()
+        except OSError:
+            pass
+    else:
+        cache = load_history_cache(cache_path)
+    cached_files = cache["files"]
+    cached_events = [event for event in cache["events"] if isinstance(event, dict)]
+    rollout_files = discover_rollout_files(codex_home)
+    valid_sessions = set(rollout_files)
+    cached_events = [
+        event for event in cached_events if event.get("session") in valid_sessions
+    ]
+    next_files: dict[str, Any] = {}
+    new_event_count = 0
+    files_read = 0
+
+    for session_key, path in sorted(rollout_files.items()):
+        try:
+            size = path.stat().st_size
+            prefix_hash = rollout_prefix_hash(path)
+        except OSError:
+            continue
+        previous = cached_files.get(session_key)
+        previous = previous if isinstance(previous, dict) else {}
+        offset = safe_int(previous.get("offset"))
+        reset_scan = size < offset or previous.get("prefixHash") != prefix_hash
+        if reset_scan:
+            offset = 0
+            cached_events = [
+                event for event in cached_events if event.get("session") != session_key
+            ]
+        initial_model = previous.get("model") if not reset_scan else None
+        initial_effort = previous.get("effort") if not reset_scan else None
+        if not isinstance(initial_model, str):
+            initial_model = None
+        if not isinstance(initial_effort, str):
+            initial_effort = None
+
+        if size > offset:
+            files_read += 1
+            new_events, state = scan_rollout_file(
+                path,
+                session_key,
+                start_offset=offset,
+                initial_model=initial_model,
+                initial_effort=initial_effort,
+            )
+            cached_events.extend(new_events)
+            new_event_count += len(new_events)
+        else:
+            state = {
+                "offset": offset,
+                "model": initial_model,
+                "effort": initial_effort,
+            }
+        next_files[session_key] = {
+            "offset": state["offset"],
+            "model": state.get("model"),
+            "effort": state.get("effort"),
+            "prefixHash": prefix_hash,
+        }
+
+    deduplicated = {
+        (event.get("session"), safe_int(event.get("position"))): event
+        for event in cached_events
+        if isinstance(event.get("timestamp"), str)
+    }
+    events = sorted(
+        deduplicated.values(),
+        key=lambda event: (
+            event.get("timestamp", ""),
+            event.get("session", ""),
+            safe_int(event.get("position")),
+        ),
+    )
+    cache_changed = (
+        new_event_count > 0
+        or next_files != cached_files
+        or len(events) != len(cache["events"])
+    )
+    if cache_changed:
+        save_history_cache(
+            cache_path,
+            {"version": HISTORY_CACHE_VERSION, "files": next_files, "events": events},
+        )
+    return events, {
+        "filesSeen": len(rollout_files),
+        "filesRead": files_read,
+        "newEvents": new_event_count,
+        "cachedEvents": len(events),
+    }
+
+
+def parse_history_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return parse_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def model_stats_template(model: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "responses": 0,
+        "inputTokens": 0,
+        "cachedInputTokens": 0,
+        "uncachedInputTokens": 0,
+        "outputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "totalTokens": 0,
+        "primaryDelta": 0.0,
+        "secondaryDelta": 0.0,
+        "primaryDeltaEvents": 0,
+        "secondaryDeltaEvents": 0,
+        "efforts": {},
+        "firstAt": None,
+        "lastAt": None,
+    }
+
+
+def history_window_identity(event: dict[str, Any], name: str) -> tuple[Any, Any, Any] | None:
+    window = event.get(name)
+    if not isinstance(window, dict) or safe_float(window.get("usedPercent")) is None:
+        return None
+    return (
+        event.get("limitId"),
+        window.get("windowMinutes"),
+        window.get("resetsAt"),
+    )
+
+
+def sample_timeline(points: list[dict[str, Any]], limit: int = 160) -> list[dict[str, Any]]:
+    if len(points) <= limit:
+        return points
+    indexes = {round(index * (len(points) - 1) / (limit - 1)) for index in range(limit)}
+    return [point for index, point in enumerate(points) if index in indexes]
+
+
+def build_model_usage_report(
+    events: list[dict[str, Any]],
+    now: datetime | None = None,
+    history_days: int = DEFAULT_HISTORY_DAYS,
+    collection_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    cutoff = now - timedelta(days=history_days) if history_days > 0 else None
+
+    selected: list[tuple[datetime, dict[str, Any]]] = []
+    all_timestamps: list[datetime] = []
+    for event in events:
+        timestamp = parse_history_timestamp(event.get("timestamp"))
+        if timestamp is None:
+            continue
+        all_timestamps.append(timestamp)
+        if cutoff is not None and timestamp < cutoff:
+            continue
+        selected.append((timestamp, event))
+    selected.sort(
+        key=lambda item: (
+            item[0],
+            item[1].get("session", ""),
+            safe_int(item[1].get("position")),
+        )
+    )
+
+    by_model: dict[str, dict[str, Any]] = {}
+    total_tokens = 0
+    known_model_tokens = 0
+    current_model = None
+    current_effort = None
+    for timestamp, event in selected:
+        model = event.get("model")
+        model = model if isinstance(model, str) and model else "Unknown"
+        stats = by_model.setdefault(model, model_stats_template(model))
+        tokens = event.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        input_tokens = safe_int(tokens.get("input"))
+        cached_tokens = min(input_tokens, safe_int(tokens.get("cachedInput")))
+        output_tokens = safe_int(tokens.get("output"))
+        reasoning_tokens = min(output_tokens, safe_int(tokens.get("reasoningOutput")))
+        event_total = safe_int(tokens.get("total"))
+        if event_total == 0:
+            event_total = input_tokens + output_tokens
+
+        if event_total > 0:
+            stats["responses"] += 1
+            stats["inputTokens"] += input_tokens
+            stats["cachedInputTokens"] += cached_tokens
+            stats["uncachedInputTokens"] += max(0, input_tokens - cached_tokens)
+            stats["outputTokens"] += output_tokens
+            stats["reasoningOutputTokens"] += reasoning_tokens
+            stats["totalTokens"] += event_total
+            total_tokens += event_total
+            if model != "Unknown":
+                known_model_tokens += event_total
+        effort = event.get("effort")
+        if isinstance(effort, str) and effort:
+            stats["efforts"][effort] = stats["efforts"].get(effort, 0) + 1
+        timestamp_text = event.get("timestamp")
+        if stats["firstAt"] is None:
+            stats["firstAt"] = timestamp_text
+        stats["lastAt"] = timestamp_text
+        if model != "Unknown":
+            current_model = model
+            current_effort = effort if isinstance(effort, str) else None
+
+    previous_windows: dict[str, dict[str, Any] | None] = {
+        "primary": None,
+        "secondary": None,
+    }
+    for _timestamp, event in selected:
+        model = event.get("model")
+        model = model if isinstance(model, str) and model else "Unknown"
+        stats = by_model.setdefault(model, model_stats_template(model))
+        for name in ("primary", "secondary"):
+            window = event.get(name)
+            identity = history_window_identity(event, name)
+            if identity is None or not isinstance(window, dict):
+                continue
+            used = safe_float(window.get("usedPercent"))
+            if used is None:
+                continue
+            previous = previous_windows[name]
+            if previous is None or previous["identity"] != identity:
+                previous_windows[name] = {"identity": identity, "used": used}
+                continue
+            delta = used - previous["used"]
+            if delta > 0:
+                field = "primaryDelta" if name == "primary" else "secondaryDelta"
+                count_field = (
+                    "primaryDeltaEvents" if name == "primary" else "secondaryDeltaEvents"
+                )
+                stats[field] += delta
+                stats[count_field] += 1
+                previous["used"] = used
+
+    models = []
+    for stats in by_model.values():
+        input_tokens = stats["inputTokens"]
+        output_tokens = stats["outputTokens"]
+        model_tokens = stats["totalTokens"]
+        stats["cachedShare"] = round(
+            (stats["cachedInputTokens"] / input_tokens) * 100, 1
+        ) if input_tokens else 0.0
+        stats["reasoningShare"] = round(
+            (stats["reasoningOutputTokens"] / output_tokens) * 100, 1
+        ) if output_tokens else 0.0
+        stats["averageTokens"] = round(model_tokens / stats["responses"]) if stats["responses"] else 0
+        stats["primaryDelta"] = round(stats["primaryDelta"], 4)
+        stats["secondaryDelta"] = round(stats["secondaryDelta"], 4)
+        stats["primaryPerMillion"] = round(
+            (stats["primaryDelta"] / model_tokens) * 1_000_000, 4
+        ) if model_tokens else None
+        stats["secondaryPerMillion"] = round(
+            (stats["secondaryDelta"] / model_tokens) * 1_000_000, 4
+        ) if model_tokens else None
+        stats["efforts"] = [
+            {"name": name, "responses": count}
+            for name, count in sorted(
+                stats["efforts"].items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
+        models.append(stats)
+    models.sort(key=lambda item: (-item["totalTokens"], item["model"].lower()))
+    color_by_model = {
+        name: MODEL_COLORS[index % len(MODEL_COLORS)]
+        for index, name in enumerate(sorted(item["model"] for item in models))
+    }
+    for stats in models:
+        stats["color"] = color_by_model[stats["model"]]
+
+    timeline: list[dict[str, Any]] = []
+    latest_primary_identity = None
+    timeline_days = min(history_days, 7) if history_days > 0 else 7
+    timeline_cutoff = now - timedelta(days=timeline_days)
+    raw_points = []
+    for timestamp, event in selected:
+        if timestamp < timeline_cutoff:
+            continue
+        identity = history_window_identity(event, "primary")
+        window = event.get("primary")
+        if identity is None or not isinstance(window, dict):
+            continue
+        latest_primary_identity = identity
+        raw_points.append(
+            {
+                "timestamp": timestamp.isoformat(),
+                "model": event.get("model") or "Unknown",
+                "effort": event.get("effort"),
+                "usedPercent": safe_float(window.get("usedPercent")) or 0.0,
+                "windowId": "|".join("" if value is None else str(value) for value in identity),
+                "windowResetAt": identity[2],
+            }
+        )
+    compressed = []
+    for point in raw_points:
+        previous = compressed[-1] if compressed else None
+        same_state = previous is not None and all(
+            point[key] == previous[key]
+            for key in ("usedPercent", "model", "windowId")
+        )
+        if not same_state:
+            compressed.append(point)
+            continue
+        if len(compressed) >= 2 and all(
+            compressed[-2][key] == previous[key]
+            for key in ("usedPercent", "model", "windowId")
+        ):
+            compressed[-1] = point
+        else:
+            compressed.append(point)
+    timeline = sample_timeline(compressed, limit=240)
+
+    local_history_start = min(all_timestamps) if all_timestamps else None
+    local_history_end = max(all_timestamps) if all_timestamps else None
+    local_history_seconds = (
+        max(0.0, (now - local_history_start).total_seconds())
+        if local_history_start
+        else 0.0
+    )
+    local_history_days = (
+        max(1, int((local_history_seconds + 86_399) // 86_400))
+        if local_history_start
+        else 0
+    )
+
+    return {
+        "schemaVersion": 1,
+        "generatedAt": now.isoformat(),
+        "historyDays": history_days,
+        "eventCount": len(selected),
+        "responseCount": sum(model["responses"] for model in models),
+        "totalTokens": total_tokens,
+        "knownModelTokenPercent": round(
+            (known_model_tokens / total_tokens) * 100, 1
+        ) if total_tokens else 0.0,
+        "currentModel": current_model,
+        "currentEffort": current_effort,
+        "models": models,
+        "timeline": timeline,
+        "timelineDays": timeline_days,
+        "timelineResetAt": latest_primary_identity[2] if latest_primary_identity else None,
+        "rangeStart": selected[0][0].isoformat() if selected else None,
+        "rangeEnd": selected[-1][0].isoformat() if selected else None,
+        "localHistoryStart": local_history_start.isoformat() if local_history_start else None,
+        "localHistoryEnd": local_history_end.isoformat() if local_history_end else None,
+        "localHistoryDays": local_history_days,
+        "collection": collection_meta or {},
+    }
+
+
+def collect_model_usage_report(
+    codex_home: Path | None = None,
+    cache_path: Path | None = None,
+    history_days: int = DEFAULT_HISTORY_DAYS,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    events, collection_meta = collect_model_history(codex_home, cache_path)
+    return build_model_usage_report(
+        events,
+        now=now,
+        history_days=history_days,
+        collection_meta=collection_meta,
+    )
+
+
+def collect_model_usage_reports(
+    history_ranges: list[int],
+    codex_home: Path | None = None,
+    cache_path: Path | None = None,
+    now: datetime | None = None,
+) -> dict[int, dict[str, Any]]:
+    events, collection_meta = collect_model_history(codex_home, cache_path)
+    now = now or datetime.now(timezone.utc)
+    return {
+        days: build_model_usage_report(
+            events,
+            now=now,
+            history_days=days,
+            collection_meta=collection_meta,
+        )
+        for days in dict.fromkeys(history_ranges)
+    }
+
+
 def format_dt(value: datetime | None, local_tz: timezone | None = None) -> str:
     if value is None:
         return "unknown"
@@ -227,6 +887,12 @@ def format_dt_compact(value: datetime | None, local_tz: timezone | None = None) 
         return "unknown"
     local_value = value.astimezone(local_tz)
     return local_value.strftime("%b %-d, %Y at %-I:%M %p")
+
+
+def format_date_only(value: datetime | None, local_tz: timezone | None = None) -> str:
+    if value is None:
+        return "unknown"
+    return value.astimezone(local_tz).strftime("%b %-d, %Y")
 
 
 def format_reset_at(
@@ -538,9 +1204,413 @@ def html_status_class(credit: ResetCredit, now: datetime, warning_hours: float) 
     return "safe"
 
 
+MODEL_COLORS = (
+    "#256c86",
+    "#217a4b",
+    "#b34a3c",
+    "#9b6a00",
+    "#14857b",
+    "#b54f78",
+    "#4d6fb3",
+)
+
+
+def model_color(model: str) -> str:
+    index = sum((position + 1) * ord(character) for position, character in enumerate(model))
+    return MODEL_COLORS[index % len(MODEL_COLORS)]
+
+
+def format_token_count(value: int) -> str:
+    number = max(0, int(value))
+    if number >= 1_000_000_000:
+        return f"{number / 1_000_000_000:.2f}B"
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.2f}M"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f}K"
+    return f"{number:,}"
+
+
+def format_quota_rate(value: Any, delta_events: int) -> str:
+    numeric = safe_float(value)
+    if numeric is None or delta_events <= 0:
+        return "Collecting data"
+    return f"{numeric:.2f} pp / 1M tokens"
+
+
+def render_quota_timeline_svg(
+    model_report: dict[str, Any],
+    local_tz: timezone | None = None,
+) -> str:
+    model_colors = {
+        str(item.get("model")): str(item.get("color"))
+        for item in model_report.get("models", [])
+        if isinstance(item, dict) and item.get("model") and item.get("color")
+    }
+
+    def color_for(model: str) -> str:
+        return model_colors.get(model, model_color(model))
+
+    raw_points = model_report.get("timeline")
+    raw_points = raw_points if isinstance(raw_points, list) else []
+    points = []
+    for raw in raw_points:
+        if not isinstance(raw, dict):
+            continue
+        timestamp = parse_history_timestamp(raw.get("timestamp"))
+        used = safe_float(raw.get("usedPercent"))
+        if timestamp is None or used is None:
+            continue
+        model = raw.get("model")
+        model = model if isinstance(model, str) and model else "Unknown"
+        window_id = raw.get("windowId")
+        window_id = window_id if isinstance(window_id, str) else ""
+        points.append((timestamp, max(0.0, min(100.0, used)), model, window_id))
+    if not points:
+        return '<div class="chart-empty">No 5-hour quota trajectory is recorded in this range yet.</div>'
+
+    width = 820
+    height = 250
+    left = 52
+    right = 18
+    top = 18
+    bottom = 38
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    first_time = points[0][0].timestamp()
+    last_time = points[-1][0].timestamp()
+    span = max(1.0, last_time - first_time)
+
+    coordinates = []
+    for index, (timestamp, used, model, window_id) in enumerate(points):
+        if len(points) == 1:
+            x = left + plot_width / 2
+        else:
+            x = left + ((timestamp.timestamp() - first_time) / span) * plot_width
+        y = top + ((100.0 - used) / 100.0) * plot_height
+        coordinates.append((x, y, timestamp, used, model, window_id, index))
+
+    grid = []
+    for used in (100, 75, 50, 25, 0):
+        y = top + ((100 - used) / 100) * plot_height
+        grid.append(
+            f'<line class="chart-grid" x1="{left}" y1="{y:.2f}" x2="{width - right}" y2="{y:.2f}" />'
+            f'<text class="chart-axis" x="{left - 9}" y="{y + 4:.2f}" text-anchor="end">{used}%</text>'
+        )
+
+    segments = []
+    for previous, current in zip(coordinates, coordinates[1:]):
+        if previous[5] != current[5]:
+            continue
+        color = color_for(current[4])
+        segments.append(
+            f'<line class="chart-segment" x1="{previous[0]:.2f}" y1="{previous[1]:.2f}" '
+            f'x2="{current[0]:.2f}" y2="{current[1]:.2f}" stroke="{color}" />'
+        )
+
+    dots = []
+    for x, y, timestamp, used, model, _window_id, _index in coordinates:
+        label = (
+            f"{model}: {used:g}% used at "
+            f"{format_dt_compact(timestamp, local_tz)}"
+        )
+        dots.append(
+            f'<circle class="chart-dot" cx="{x:.2f}" cy="{y:.2f}" r="4.5" '
+            f'fill="{color_for(model)}"><title>{html_escape(label)}</title></circle>'
+        )
+
+    start_label = format_dt_compact(points[0][0], local_tz)
+    end_label = format_dt_compact(points[-1][0], local_tz)
+    legend_models = []
+    seen_models = set()
+    for _timestamp, _used, model, _window_id in points:
+        if model not in seen_models:
+            seen_models.add(model)
+            legend_models.append(model)
+    legend = "".join(
+        f'<span class="legend-item"><i style="background:{color_for(model)}"></i>{html_escape(model)}</span>'
+        for model in legend_models
+    )
+
+    return f"""
+      <div class="timeline-chart">
+        <svg viewBox="0 0 {width} {height}" role="img" aria-label="5-hour quota percentage used over time by model">
+          {"".join(grid)}
+          {"".join(segments)}
+          {"".join(dots)}
+          <text class="chart-axis chart-time" x="{left}" y="{height - 10}">{html_escape(start_label)}</text>
+          <text class="chart-axis chart-time" x="{width - right}" y="{height - 10}" text-anchor="end">{html_escape(end_label)}</text>
+        </svg>
+        <div class="chart-legend">{legend}</div>
+      </div>
+    """
+
+
+def render_model_usage_section(
+    model_report: dict[str, Any] | None,
+    local_tz: timezone | None = None,
+    live: bool = False,
+    interactive_static: bool = False,
+) -> str:
+    if not model_report:
+        return ""
+    models = model_report.get("models")
+    models = models if isinstance(models, list) else []
+    history_days = safe_int(model_report.get("historyDays"))
+    local_history_days = safe_int(model_report.get("localHistoryDays"))
+    if history_days == 0:
+        range_label = f"All local history · {local_history_days} days available"
+    elif local_history_days and local_history_days < history_days:
+        range_label = (
+            f"Last {history_days} days requested · {local_history_days} days available locally"
+        )
+    else:
+        range_label = f"Last {history_days} days"
+    local_start = parse_history_timestamp(model_report.get("localHistoryStart"))
+    local_end = parse_history_timestamp(model_report.get("localHistoryEnd"))
+    local_span = (
+        f"Local records: {format_date_only(local_start, local_tz)} through "
+        f"{format_date_only(local_end, local_tz)}"
+        if local_start and local_end
+        else "No local rollout records found"
+    )
+    current_model = model_report.get("currentModel") or "Not identified yet"
+    current_effort = model_report.get("currentEffort")
+    current_label = str(current_model)
+    if isinstance(current_effort, str) and current_effort:
+        current_label += f" · {current_effort}"
+
+    range_options = []
+    for days, label in ((7, "7d"), (30, "30d"), (90, "90d"), (0, "All")):
+        selected = days == history_days
+        if live:
+            class_name = "range-option selected" if selected else "range-option"
+            range_options.append(
+                f'<a class="{class_name}" href="/?days={days}">{label}</a>'
+            )
+        elif interactive_static:
+            class_name = "range-option selected" if selected else "range-option"
+            pressed = "true" if selected else "false"
+            range_options.append(
+                f'<button class="{class_name}" type="button" data-history-range="{days}" '
+                f'aria-pressed="{pressed}">{label}</button>'
+            )
+        else:
+            class_name = "range-option selected" if selected else "range-option disabled"
+            range_options.append(f'<span class="{class_name}">{label}</span>')
+    if live:
+        export_href = f"/model-usage.json?days={history_days}"
+    else:
+        export_json = json.dumps(model_report, indent=2, sort_keys=True) + "\n"
+        export_href = "data:application/json;charset=utf-8," + urllib.parse.quote(
+            export_json,
+            safe="",
+        )
+    export_link = (
+        f'<a class="export-link" href="{html_escape(export_href)}" '
+        'download="codex-model-usage-report.json">Export JSON</a>'
+    )
+
+    if not models:
+        collection = model_report.get("collection")
+        collection = collection if isinstance(collection, dict) else {}
+        history_error = collection.get("error")
+        empty_title = "Could not read local model history" if history_error else "No model token records in this range"
+        empty_copy = (
+            str(history_error)
+            if history_error
+            else "Use Codex normally, then refresh this report. New responses will appear automatically."
+        )
+        model_content = f"""
+          <section class="history-empty">
+            <h3>{html_escape(empty_title)}</h3>
+            <p>{html_escape(empty_copy)}</p>
+          </section>
+        """
+    else:
+        max_tokens = max(safe_int(model.get("totalTokens")) for model in models) or 1
+        quota_rates = [
+            safe_float(model.get("primaryPerMillion"))
+            for model in models
+            if safe_float(model.get("primaryPerMillion")) is not None
+            and safe_int(model.get("primaryDeltaEvents")) > 0
+        ]
+        max_quota_rate = max(quota_rates) if quota_rates else 1.0
+        model_rows = []
+        for model in models:
+            name = str(model.get("model") or "Unknown")
+            color = str(model.get("color") or model_color(name))
+            total_tokens = safe_int(model.get("totalTokens"))
+            response_count = safe_int(model.get("responses"))
+            response_word = "response" if response_count == 1 else "responses"
+            token_width = max(1.5, (total_tokens / max_tokens) * 100) if total_tokens else 0
+            quota_rate = safe_float(model.get("primaryPerMillion"))
+            delta_events = safe_int(model.get("primaryDeltaEvents"))
+            quota_width = (
+                max(1.5, (quota_rate / max_quota_rate) * 100)
+                if quota_rate is not None and delta_events > 0 and max_quota_rate
+                else 0
+            )
+            effort_items = model.get("efforts")
+            effort_items = effort_items if isinstance(effort_items, list) else []
+            effort_copy = ", ".join(
+                f"{item.get('name')} {safe_int(item.get('responses')):,}"
+                for item in effort_items[:3]
+                if isinstance(item, dict) and item.get("name")
+            ) or "not recorded"
+            primary_delta = safe_float(model.get("primaryDelta")) or 0.0
+            model_rows.append(
+                f"""
+                <section class="model-row">
+                  <div class="model-row-head">
+                    <div>
+                      <h3><i style="background:{html_escape(color)}"></i>{html_escape(name)}</h3>
+                      <p>{response_count:,} model {response_word} · effort {html_escape(effort_copy)}</p>
+                    </div>
+                    <strong>{format_token_count(total_tokens)} tokens</strong>
+                  </div>
+                  <div class="metric-bar-row">
+                    <span>Recorded token volume</span>
+                    <div class="metric-track"><i style="width:{token_width:.2f}%;background:{html_escape(color)}"></i></div>
+                    <strong>{format_token_count(total_tokens)}</strong>
+                  </div>
+                  <div class="metric-bar-row">
+                    <span>5h quota burn / 1M tokens</span>
+                    <div class="metric-track quota"><i style="width:{quota_width:.2f}%;background:{html_escape(color)}"></i></div>
+                    <strong>{html_escape(format_quota_rate(quota_rate, delta_events))}</strong>
+                  </div>
+                  <div class="model-facts">
+                    <span>{safe_float(model.get('cachedShare')) or 0:g}% of input was cached</span>
+                    <span>{format_token_count(safe_int(model.get('averageTokens')))} tokens / model response</span>
+                    <span>{primary_delta:g} total 5h quota points observed</span>
+                  </div>
+                </section>
+                """
+            )
+        model_content = "".join(model_rows)
+
+    timeline = render_quota_timeline_svg(model_report, local_tz)
+    timeline_days = safe_int(model_report.get("timelineDays")) or 7
+    reset_copy = f"Last {timeline_days} days of recorded windows · gaps mark quota resets"
+
+    return f"""
+    <section class="history-section">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Local history · {html_escape(range_label)}</p>
+          <h2>Model usage</h2>
+          <p class="section-copy">Compare recorded token volume with observed changes in your Codex quota.</p>
+          <p class="section-data-span">{html_escape(local_span)}</p>
+        </div>
+        <div class="history-controls">
+          <nav class="range-control" aria-label="History range">{"".join(range_options)}</nav>
+          {export_link}
+        </div>
+      </div>
+
+      <section class="history-summary">
+        <div><span>Latest model</span><strong>{html_escape(current_label)}</strong></div>
+        <div><span>Recorded tokens</span><strong>{format_token_count(safe_int(model_report.get('totalTokens')))}</strong></div>
+        <div><span>Model responses</span><strong>{safe_int(model_report.get('responseCount')):,}</strong></div>
+        <div><span>Model coverage</span><strong>{safe_float(model_report.get('knownModelTokenPercent')) or 0:g}%</strong></div>
+      </section>
+
+      <section class="history-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>Quota trajectory</h3>
+            <p>{html_escape(reset_copy)}</p>
+          </div>
+          <span>5-hour usage %</span>
+        </div>
+        {timeline}
+      </section>
+
+      <section class="metric-definitions" aria-labelledby="metric-definitions-{history_days}">
+        <h3 id="metric-definitions-{history_days}">Metric definitions</h3>
+        <dl>
+          <div><dt>Recorded tokens</dt><dd>Input plus output tokens reported after each model response. Cached input is included in this total.</dd></div>
+          <div><dt>Cached input</dt><dd>The share of input context Codex marked as reused from cache. A high share is normal in long, tool-using tasks.</dd></div>
+          <div><dt>5h quota burn / 1M tokens</dt><dd>Observed increases in the account's 5-hour usage percentage, divided by recorded tokens. Lower may be better after a meaningful sample.</dd></div>
+          <div><dt>Total 5h quota points observed</dt><dd>The sample size behind that rate. Five points means changes such as 20% to 25%; it does not mean five hours or five resets.</dd></div>
+          <div><dt>Model responses</dt><dd>Individual model steps, including tool-call steps. This count is larger than the number of messages or tasks.</dd></div>
+          <div><dt>Model coverage</dt><dd>The share of recorded tokens whose rollout entry identified a model. Unknown model entries are kept separate.</dd></div>
+        </dl>
+      </section>
+
+      <div class="model-list">{model_content}</div>
+
+      <p class="method-note"><strong>Methodology:</strong> Actual token counts come from Codex's local per-response records. Quota percentages are rounded, account-wide snapshots, so model attribution is an observed estimate. Overlapping tasks and work on another device can affect the percentage between samples. “pp” means percentage points; for the burn rate, lower is better after you have a meaningful sample.</p>
+    </section>
+    """
+
+
+def render_model_usage_variants(
+    model_report: dict[str, Any] | None,
+    model_reports: dict[int, dict[str, Any]] | None,
+    local_tz: timezone | None = None,
+    live: bool = False,
+) -> str:
+    if live or not model_reports:
+        return render_model_usage_section(model_report, local_tz, live)
+
+    active_days = safe_int((model_report or {}).get("historyDays"))
+    if active_days not in model_reports:
+        active_days = 30 if 30 in model_reports else next(iter(model_reports))
+    ordered_days = [days for days in (7, 30, 90, 0) if days in model_reports]
+    ordered_days.extend(days for days in model_reports if days not in ordered_days)
+    variants = []
+    for days in ordered_days:
+        hidden = "" if days == active_days else " hidden"
+        variants.append(
+            f'<div class="history-variant" data-history-panel="{days}"{hidden}>'
+            + render_model_usage_section(
+                model_reports[days],
+                local_tz,
+                live=False,
+                interactive_static=True,
+            )
+            + "</div>"
+        )
+
+    script = """
+    <script>
+      (() => {
+        for (const root of document.querySelectorAll("[data-history-variants]")) {
+          const activate = (days, updateHash) => {
+            const value = String(days);
+            for (const panel of root.querySelectorAll("[data-history-panel]")) {
+              panel.hidden = panel.dataset.historyPanel !== value;
+            }
+            for (const button of root.querySelectorAll("[data-history-range]")) {
+              const selected = button.dataset.historyRange === value;
+              button.classList.toggle("selected", selected);
+              button.setAttribute("aria-pressed", selected ? "true" : "false");
+            }
+            if (updateHash) history.replaceState(null, "", "#history-" + value);
+          };
+          root.addEventListener("click", (event) => {
+            const button = event.target.closest("[data-history-range]");
+            if (button && root.contains(button)) activate(button.dataset.historyRange, true);
+          });
+          const match = location.hash.match(/^#history-(7|30|90|0)$/);
+          activate(match ? match[1] : root.dataset.defaultHistory, false);
+        }
+      })();
+    </script>
+    """
+    return (
+        f'<div class="history-variants" data-history-variants '
+        f'data-default-history="{active_days}">{"".join(variants)}</div>'
+        + script
+    )
+
+
 def render_html_dashboard(
     payload: dict[str, Any],
     usage_payload: dict[str, Any] | None = None,
+    model_report: dict[str, Any] | None = None,
+    model_reports: dict[int, dict[str, Any]] | None = None,
     now: datetime | None = None,
     local_tz: timezone | None = None,
     warning_hours: float = 48,
@@ -562,7 +1632,7 @@ def render_html_dashboard(
         else "No available reset expiry"
     )
     next_expiry = (
-        format_dt(next_credit.expires_at, local_tz)
+        format_dt_compact(next_credit.expires_at, local_tz)
         if next_credit
         else "No available resets"
     )
@@ -581,15 +1651,15 @@ def render_html_dashboard(
                 <span class="pill">{html_escape(credit.status)}</span>
               </div>
               <h2>{html_escape(friendly_title(credit))}</h2>
-              <p class="big-date">{html_escape(format_dt(credit.expires_at, local_tz))}</p>
-              <p class="subtle">UTC: {html_escape(format_dt(credit.expires_at, timezone.utc))}</p>
+              <p class="field-label">Expires</p>
+              <p class="big-date">{html_escape(format_dt_compact(credit.expires_at, local_tz))}</p>
               <div class="bar" aria-label="Reset lifetime remaining">
                 <span style="width: {0 if percent_left is None else percent_left}%"></span>
               </div>
               <dl>
-                <div><dt>Time left</dt><dd>{html_escape(format_duration_words(seconds_left or 0) if seconds_left is not None else "unknown")}</dd></div>
+                <div><dt>Countdown from snapshot</dt><dd>{html_escape(format_duration_words(seconds_left or 0) if seconds_left is not None else "unknown")}</dd></div>
                 <div><dt>Lifetime left</dt><dd>{html_escape(str(percent_left) + "%" if percent_left is not None else "unknown")}</dd></div>
-                <div><dt>Granted</dt><dd>{html_escape(format_dt(credit.granted_at, local_tz))}</dd></div>
+                <div><dt>Granted</dt><dd>{html_escape(format_dt_compact(credit.granted_at, local_tz))}</dd></div>
               </dl>
             </section>
             """
@@ -608,12 +1678,11 @@ def render_html_dashboard(
               <div>
                 <p class="eyebrow">{html_escape(window.label)} usage limit</p>
                 <p class="usage-percent">{window.remaining_percent}% left</p>
-                <p class="subtle">{window.used_percent}% used</p>
               </div>
               <div class="bar" aria-label="{html_escape(window.label)} usage remaining">
                 <span style="width: {window.remaining_percent}%"></span>
               </div>
-              <p class="subtle">Resets {html_escape(format_reset_at(window.reset_at, now, local_tz))}</p>
+              <p class="subtle">Resets {html_escape(format_reset_at_compact(window.reset_at, now, local_tz))}</p>
             </section>
             """
         )
@@ -636,9 +1705,20 @@ def render_html_dashboard(
     refresh_copy = (
         f"Auto-refreshes every {refresh_seconds} seconds while this local server is running."
         if live and refresh_seconds and refresh_seconds > 0
-        else "Refresh the page to fetch a new read-only snapshot."
+        else "Snapshot values stay fixed until a new report is generated."
     )
     mode_label = "Live local dashboard" if live else "Local snapshot"
+    model_section = render_model_usage_variants(
+        model_report,
+        model_reports,
+        local_tz,
+        live,
+    )
+    refresh_action = (
+        f'<a class="button" href="/?days={safe_int(model_report.get("historyDays")) if model_report else DEFAULT_HISTORY_DAYS}">Refresh</a>'
+        if live
+        else ""
+    )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -646,7 +1726,7 @@ def render_html_dashboard(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   {refresh_meta}
-  <title>Codex Reset Expiry</title>
+  <title>Codex Usage Report</title>
   <style>
     :root {{
       color-scheme: light dark;
@@ -731,7 +1811,7 @@ def render_html_dashboard(
       gap: 12px;
       margin-bottom: 14px;
     }}
-    .summary-card, .reset-card, .usage-card, .note {{
+    .summary-card, .reset-card, .usage-card, .note, .history-panel, .model-row, .history-empty {{
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -778,7 +1858,7 @@ def render_html_dashboard(
       color: var(--muted);
       font-size: 12px;
       font-weight: 700;
-      letter-spacing: .08em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }}
     .pill {{
@@ -797,6 +1877,12 @@ def render_html_dashboard(
       font-size: 22px;
       font-weight: 750;
       line-height: 1.2;
+    }}
+    .field-label {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      margin: 0 0 4px;
     }}
     .subtle {{
       color: var(--muted);
@@ -839,9 +1925,301 @@ def render_html_dashboard(
       font-size: 14px;
     }}
     .note strong {{ color: var(--ink); }}
+    .history-section {{
+      margin-top: 38px;
+      padding-top: 28px;
+      border-top: 1px solid var(--line);
+    }}
+    .section-heading {{
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 16px;
+    }}
+    .section-heading h2 {{
+      font-size: 24px;
+      line-height: 1.15;
+      letter-spacing: 0;
+      margin: 5px 0 6px;
+    }}
+    .section-copy {{
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .section-data-span {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 5px;
+    }}
+    .range-control {{
+      display: inline-grid;
+      grid-template-columns: repeat(4, minmax(42px, 1fr));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      flex: 0 0 auto;
+    }}
+    .history-controls {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .export-link {{
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      text-decoration: none;
+      white-space: nowrap;
+    }}
+    .export-link:hover {{ text-decoration: underline; }}
+    .range-option {{
+      color: var(--muted);
+      background: var(--panel);
+      border: 0;
+      border-radius: 0;
+      text-align: center;
+      text-decoration: none;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      padding: 7px 10px;
+      border-right: 1px solid var(--line);
+      cursor: pointer;
+    }}
+    .range-option:last-child {{ border-right: 0; }}
+    .range-option.selected {{
+      color: var(--panel);
+      background: var(--ink);
+    }}
+    .range-option.disabled:not(.selected) {{ opacity: .55; cursor: default; }}
+    .history-variant[hidden] {{ display: none; }}
+    .history-summary {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 14px;
+    }}
+    .history-summary div {{
+      min-width: 0;
+      padding: 14px 16px;
+      border-right: 1px solid var(--line);
+    }}
+    .history-summary div:first-child {{ padding-left: 0; }}
+    .history-summary div:last-child {{ border-right: 0; }}
+    .history-summary span {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }}
+    .history-summary strong {{
+      display: block;
+      font-size: 17px;
+      overflow-wrap: anywhere;
+    }}
+    .history-panel {{
+      margin-bottom: 14px;
+      padding: 18px;
+    }}
+    .metric-definitions {{
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      padding: 16px 0;
+      margin: 0 0 14px;
+    }}
+    .metric-definitions h3 {{
+      font-size: 15px;
+      letter-spacing: 0;
+      margin: 0 0 12px;
+    }}
+    .metric-definitions dl {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px 22px;
+      margin: 0;
+    }}
+    .metric-definitions dl div {{
+      display: block;
+      border: 0;
+      padding: 0;
+    }}
+    .metric-definitions dt {{
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 750;
+      margin-bottom: 4px;
+    }}
+    .metric-definitions dd {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 400;
+      line-height: 1.45;
+      text-align: left;
+    }}
+    .panel-heading {{
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 16px;
+      margin-bottom: 10px;
+    }}
+    .panel-heading h3 {{
+      font-size: 17px;
+      letter-spacing: 0;
+      margin: 0 0 4px;
+    }}
+    .panel-heading p, .panel-heading > span {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .timeline-chart svg {{
+      display: block;
+      width: 100%;
+      aspect-ratio: 820 / 250;
+      min-height: 210px;
+      overflow: visible;
+    }}
+    .chart-grid {{ stroke: var(--line); stroke-width: 1; }}
+    .chart-axis {{ fill: var(--muted); font-size: 11px; }}
+    .chart-segment {{ stroke-width: 3; stroke-linecap: round; }}
+    .chart-dot {{ stroke: var(--panel); stroke-width: 2; }}
+    .chart-legend {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      min-height: 18px;
+      margin-top: 4px;
+    }}
+    .legend-item {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .legend-item i {{
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+    }}
+    .chart-empty {{
+      color: var(--muted);
+      min-height: 180px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      font-size: 14px;
+    }}
+    .model-list {{
+      display: grid;
+      gap: 12px;
+    }}
+    .model-row {{ padding: 18px; }}
+    .model-row-head {{
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 16px;
+    }}
+    .model-row-head h3 {{
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 17px;
+      letter-spacing: 0;
+      margin: 0 0 4px;
+      overflow-wrap: anywhere;
+    }}
+    .model-row-head h3 i {{
+      display: inline-block;
+      flex: 0 0 auto;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }}
+    .model-row-head p {{ color: var(--muted); font-size: 12px; }}
+    .model-row-head > strong {{ white-space: nowrap; font-size: 15px; }}
+    .metric-bar-row {{
+      display: grid;
+      grid-template-columns: minmax(150px, .9fr) minmax(180px, 1.8fr) minmax(145px, 1fr);
+      align-items: center;
+      gap: 12px;
+      margin-top: 10px;
+      font-size: 13px;
+    }}
+    .metric-bar-row > span {{ color: var(--muted); }}
+    .metric-bar-row > strong {{ text-align: right; font-size: 12px; }}
+    .metric-track {{
+      width: 100%;
+      height: 10px;
+      background: color-mix(in srgb, var(--line), transparent 15%);
+      border-radius: 5px;
+      overflow: hidden;
+    }}
+    .metric-track i {{
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+    }}
+    .metric-track.quota {{ height: 7px; }}
+    .model-facts {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px 18px;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+      margin-top: 14px;
+      font-size: 12px;
+    }}
+    .method-note {{
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      border-left: 3px solid var(--accent);
+      padding-left: 12px;
+      margin-top: 14px;
+    }}
+    .method-note strong {{ color: var(--ink); }}
+    .history-empty h3 {{
+      font-size: 16px;
+      letter-spacing: 0;
+      margin: 0 0 5px;
+    }}
+    .history-empty p {{ color: var(--muted); font-size: 13px; }}
     @media (max-width: 720px) {{
       body {{ padding: 20px; }}
-      header, .summary, .usage-grid {{ grid-template-columns: 1fr; }}
+      header, .summary, .usage-grid, .history-summary {{ grid-template-columns: 1fr; }}
+      .section-heading {{ align-items: stretch; flex-direction: column; }}
+      .history-controls, .range-control {{ width: 100%; }}
+      .history-controls {{ justify-content: space-between; }}
+      .history-summary div, .history-summary div:first-child {{
+        padding: 11px 0;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }}
+      .history-summary div:last-child {{ border-bottom: 0; }}
+      .metric-definitions dl {{ grid-template-columns: 1fr; gap: 12px; }}
+      .timeline-chart svg {{ min-height: 180px; }}
+      .model-row-head {{ align-items: start; }}
+      .metric-bar-row {{
+        grid-template-columns: 1fr auto;
+        gap: 7px 10px;
+      }}
+      .metric-track {{ grid-column: 1 / -1; grid-row: 2; }}
+      .metric-bar-row > strong {{ text-align: right; }}
+    }}
+    @media (max-width: 460px) {{
+      body {{ padding: 14px; }}
+      .summary-card, .reset-card, .usage-card, .history-panel, .model-row {{ padding: 14px; }}
+      .model-row-head {{ display: grid; }}
+      .model-row-head > strong {{ white-space: normal; }}
     }}
   </style>
 </head>
@@ -849,12 +2227,12 @@ def render_html_dashboard(
   <main>
     <header>
       <div>
-        <h1>Codex reset expiry</h1>
-        <p class="checked">Snapshot generated {html_escape(format_dt(now, local_tz))}</p>
+        <h1>Codex usage report</h1>
+        <p class="checked">Snapshot generated {html_escape(format_dt_compact(now, local_tz))}</p>
       </div>
       <div class="toolbar">
         <span class="mode">{html_escape(mode_label)}</span>
-        <a class="button" href="/">Refresh</a>
+        {refresh_action}
       </div>
     </header>
 
@@ -868,7 +2246,7 @@ def render_html_dashboard(
         <p class="value">{html_escape(next_expiry)}</p>
       </div>
       <div class="summary-card">
-        <p class="label">Time left</p>
+        <p class="label">Countdown from snapshot</p>
         <p class="value">{html_escape(next_left)}</p>
       </div>
     </section>
@@ -881,6 +2259,8 @@ def render_html_dashboard(
       {"".join(cards)}
     </section>
 
+    {model_section}
+
     <p class="note"><strong>Safety:</strong> this page uses a local read-only checker bound to your machine. Redeem resets only inside the Codex app. {html_escape(refresh_copy)}</p>
   </main>
 </body>
@@ -891,6 +2271,7 @@ def render_html_dashboard(
 def build_summary_payload(
     reset_payload: dict[str, Any],
     usage_payload: dict[str, Any] | None = None,
+    latest_model: dict[str, Any] | None = None,
     now: datetime | None = None,
     local_tz: timezone | None = None,
 ) -> dict[str, Any]:
@@ -933,6 +2314,7 @@ def build_summary_payload(
             }
             for window in usage_windows
         ],
+        "model": latest_model,
         "resets": {
             "availableCount": available_count,
             "nextExpiry": (
@@ -1058,6 +2440,16 @@ def parse_hours(value: str) -> list[int]:
     return hours
 
 
+def parse_history_days(value: str) -> int:
+    try:
+        days = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("history days must be a whole number") from error
+    if days < 0:
+        raise argparse.ArgumentTypeError("history days cannot be negative")
+    return days
+
+
 class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -1065,6 +2457,10 @@ class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
 
 def serve_dashboard(
     auth_path: Path,
+    codex_home: Path,
+    history_cache: Path | None,
+    history_days: int,
+    include_model_history: bool,
     port: int,
     warning_hours: float,
     refresh_seconds: int,
@@ -1092,6 +2488,37 @@ def serve_dashboard(
             self.end_headers()
             self.wfile.write(body_bytes)
 
+        def send_json(self, status: int, payload: dict[str, Any]) -> None:
+            body_bytes = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Content-Disposition",
+                'attachment; filename="codex-model-usage-report.json"',
+            )
+            self.end_headers()
+            self.wfile.write(body_bytes)
+
+        def requested_history_days(self, parsed: urllib.parse.ParseResult) -> int:
+            values = urllib.parse.parse_qs(parsed.query).get("days") or []
+            if not values:
+                return history_days
+            try:
+                requested = int(values[0])
+            except (TypeError, ValueError):
+                return history_days
+            return requested if 0 <= requested <= 3650 else history_days
+
+        def collect_report(self, requested_days: int, now: datetime) -> dict[str, Any]:
+            return collect_model_usage_report(
+                codex_home=codex_home,
+                cache_path=history_cache,
+                history_days=requested_days,
+                now=now,
+            )
+
         def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/health":
@@ -1101,16 +2528,43 @@ def serve_dashboard(
                 self.send_response(204)
                 self.end_headers()
                 return
+            requested_days = self.requested_history_days(parsed)
+            if parsed.path == "/model-usage.json":
+                if not include_model_history:
+                    self.send_json(404, {"error": "Model history is disabled."})
+                    return
+                try:
+                    self.send_json(
+                        200,
+                        self.collect_report(requested_days, datetime.now(timezone.utc)),
+                    )
+                except Exception as error:
+                    self.send_json(500, {"error": f"Could not read model history: {error}"})
+                return
             if parsed.path not in {"/", "/index.html"}:
                 self.send_text(404, "not found\n")
                 return
 
             try:
+                now = datetime.now(timezone.utc)
                 payload = fetch_reset_payload(auth_path)
                 usage_payload = try_fetch_usage_payload(auth_path)
+                model_report = None
+                if include_model_history:
+                    try:
+                        model_report = self.collect_report(requested_days, now)
+                    except Exception as history_error:
+                        model_report = build_model_usage_report(
+                            [],
+                            now=now,
+                            history_days=requested_days,
+                            collection_meta={"error": str(history_error)},
+                        )
                 body = render_html_dashboard(
                     payload,
                     usage_payload=usage_payload,
+                    model_report=model_report,
+                    now=now,
                     warning_hours=warning_hours,
                     live=True,
                     refresh_seconds=refresh_seconds,
@@ -1129,7 +2583,7 @@ def serve_dashboard(
 
     actual_port = int(httpd.server_address[1])
     url = f"http://127.0.0.1:{actual_port}/"
-    print(f"Codex reset expiry dashboard is running at {url}", flush=True)
+    print(f"Codex usage report is running at {url}", flush=True)
     print("Read-only mode. Redeem resets only inside the Codex app.", flush=True)
     print(
         "Leave this window open while using the live dashboard. Press Ctrl-C to stop.",
@@ -1141,7 +2595,7 @@ def serve_dashboard(
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopped Codex reset expiry dashboard.")
+        print("\nStopped Codex usage report.")
     finally:
         httpd.server_close()
     return 0
@@ -1156,6 +2610,28 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=default_auth_path(),
         help="Path to Codex auth.json. Defaults to $CODEX_HOME/auth.json or ~/.codex/auth.json.",
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=default_codex_home(),
+        help="Codex data directory used for local model/token history. Defaults to $CODEX_HOME or ~/.codex.",
+    )
+    parser.add_argument(
+        "--history-cache",
+        type=Path,
+        help=f"Private incremental history cache. Defaults to $CODEX_HOME/{HISTORY_CACHE_NAME}.",
+    )
+    parser.add_argument(
+        "--history-days",
+        type=parse_history_days,
+        default=DEFAULT_HISTORY_DAYS,
+        help=f"Model history range in days; 0 means all local history. Default: {DEFAULT_HISTORY_DAYS}.",
+    )
+    parser.add_argument(
+        "--no-model-history",
+        action="store_true",
+        help="Do not read local Codex rollout records for model/token statistics.",
     )
     parser.add_argument(
         "--json",
@@ -1186,6 +2662,11 @@ def main(argv: list[str] | None = None) -> int:
         "--html",
         type=Path,
         help="Write a local HTML dashboard snapshot.",
+    )
+    parser.add_argument(
+        "--model-json",
+        type=Path,
+        help="Write a sanitized aggregate model/token usage report as JSON.",
     )
     parser.add_argument(
         "--quiet",
@@ -1231,6 +2712,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.serve:
         return serve_dashboard(
             args.auth,
+            args.codex_home,
+            args.history_cache,
+            args.history_days,
+            not args.no_model_history,
             args.port,
             args.warning_hours,
             args.refresh_seconds,
@@ -1252,12 +2737,16 @@ def main(argv: list[str] | None = None) -> int:
 
     usage_payload = try_fetch_usage_payload(args.auth)
 
-    should_print = not args.quiet or (not args.ics and not args.html)
+    should_print = not args.quiet or (not args.ics and not args.html and not args.model_json)
 
     if args.summary_json:
         print(
             json.dumps(
-                build_summary_payload(payload, usage_payload=usage_payload),
+                build_summary_payload(
+                    payload,
+                    usage_payload=usage_payload,
+                    latest_model=latest_local_model(args.codex_home),
+                ),
                 indent=2,
                 sort_keys=True,
             )
@@ -1287,11 +2776,54 @@ def main(argv: list[str] | None = None) -> int:
         if should_print:
             print(f"\nWrote calendar reminders: {args.ics}")
 
+    generated_at = datetime.now(timezone.utc)
+    model_report = None
+    model_reports = None
+    if not args.no_model_history and (args.html or args.model_json):
+        history_ranges = [args.history_days]
+        if args.html:
+            history_ranges = [7, 30, 90, 0, args.history_days]
+        try:
+            model_reports = collect_model_usage_reports(
+                history_ranges,
+                codex_home=args.codex_home,
+                cache_path=args.history_cache,
+                now=generated_at,
+            )
+            model_report = model_reports[args.history_days]
+        except Exception as history_error:
+            if args.model_json:
+                print(f"Could not build model usage report: {history_error}", file=sys.stderr)
+                return 2
+            model_reports = {
+                days: build_model_usage_report(
+                    [],
+                    now=generated_at,
+                    history_days=days,
+                    collection_meta={"error": str(history_error)},
+                )
+                for days in dict.fromkeys(history_ranges)
+            }
+            model_report = model_reports[args.history_days]
+
+    if args.model_json:
+        if model_report is None:
+            print("Model history is disabled; no JSON report was written.", file=sys.stderr)
+            return 2
+        args.model_json.expanduser().write_text(
+            json.dumps(model_report, indent=2, sort_keys=True) + "\n"
+        )
+        if should_print:
+            print(f"\nWrote model usage JSON: {args.model_json}")
+
     if args.html:
         args.html.expanduser().write_text(
             render_html_dashboard(
                 payload,
                 usage_payload=usage_payload,
+                model_report=model_report,
+                model_reports=model_reports,
+                now=generated_at,
                 warning_hours=args.warning_hours,
             )
         )
